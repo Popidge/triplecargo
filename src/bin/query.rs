@@ -1,12 +1,9 @@
 use std::path::PathBuf;
-use std::time::Instant;
 
 use clap::{Parser, ValueEnum};
-
 use triplecargo::{
     load_cards_from_json, zobrist_key, Element, GameState, Owner, Rules,
-    solver::{precompute_solve, ElementsMode, search_root, InMemoryTT},
-    persist::{DbHeader, save_db, fingerprint_cards},
+    persist::{load_db, ElementsMode},
 };
 
 #[derive(Debug, Clone, ValueEnum)]
@@ -16,8 +13,12 @@ enum ElementsOpt {
 }
 
 #[derive(Debug, Parser)]
-#[command(name = "precompute", about = "Triplecargo precompute driver")]
+#[command(name = "query", about = "Triplecargo solved DB query tool")]
 struct Args {
+    /// Solved DB file path (produced by precompute)
+    #[arg(long, default_value = "solved.bin")]
+    db: PathBuf,
+
     /// Rules toggles as comma-separated list: elemental,same,plus,same_wall (or 'none')
     #[arg(long, default_value = "none")]
     rules: String,
@@ -27,7 +28,7 @@ struct Args {
     #[arg(long, num_args = 2)]
     hands: Vec<String>,
 
-    /// Elements mode: none | random
+    /// Elements mode for reconstructing the state key: none | random
     #[arg(long, value_enum, default_value_t = ElementsOpt::None)]
     elements: ElementsOpt,
 
@@ -35,17 +36,9 @@ struct Args {
     #[arg(long, default_value_t = 0x00C0FFEEu64)]
     seed: u64,
 
-    /// Optional cap on search depth (plies remaining), 1..=9; omit for full depth.
-    #[arg(long)]
-    max_depth: Option<u8>,
-
-    /// Cards JSON path (defaults to data/cards.json)
+    /// Cards JSON path (defaults to data/cards.json) - used only for validation if desired
     #[arg(long, default_value = "data/cards.json")]
     cards: String,
-
-    /// Output DB file path
-    #[arg(long, default_value = "solved.bin")]
-    out: PathBuf,
 }
 
 fn parse_rules(s: &str) -> Rules {
@@ -61,9 +54,7 @@ fn parse_rules(s: &str) -> Rules {
             "plus" => r.plus = true,
             "same_wall" | "samewall" => r.same_wall = true,
             "" => {}
-            other => {
-                eprintln!("[precompute] Warning: ignoring unknown rule token '{other}'");
-            }
+            _ => {}
         }
     }
     r
@@ -134,7 +125,7 @@ fn gen_elements(seed: u64) -> [Option<Element>; 9] {
     let mut arr: [Option<Element>; 9] = [None; 9];
     for i in 0..9 {
         let r = splitmix64(&mut s);
-        let k = (r % 9) as u8; // uniform over 0..=8: None + 8 elements
+        let k = (r % 9) as u8; // uniform over 0..=8
         arr[i] = to_elem(k);
     }
     arr
@@ -143,19 +134,19 @@ fn gen_elements(seed: u64) -> [Option<Element>; 9] {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
-    let t0 = Instant::now();
+    // Load DB
+    let (header, map) = load_db(&args.db)
+        .map_err(|e| format!("DB load error: {e}"))?;
 
-    // Load cards (for validation and header fingerprint)
-    let cards = load_cards_from_json(&args.cards)
-        .map_err(|e| format!("Cards load error: {e}"))?;
-    println!("[precompute] Loaded {} cards (max id {}).", cards.len(), cards.max_id());
+    // Optionally, load cards just for validation or future use
+    if let Err(e) = load_cards_from_json(&args.cards) {
+        eprintln!("[query] Warning: could not load cards JSON: {e}");
+    }
 
-    // Parse inputs
+    // Build a state using provided flags (must match the one used during precompute)
     let rules = parse_rules(&args.rules);
     let (hand_a, hand_b) = parse_hands(&args.hands)
         .map_err(|e| format!("Hands parse error: {e}"))?;
-
-    // Construct initial state
     let elements_mode = match args.elements {
         ElementsOpt::None => ElementsMode::None,
         ElementsOpt::Random => ElementsMode::Random,
@@ -164,54 +155,41 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ElementsMode::None => None,
         ElementsMode::Random => Some(gen_elements(args.seed)),
     };
-    let initial = GameState::with_hands(rules, hand_a, hand_b, cell_elements);
+    let gs = GameState::with_hands(rules, hand_a, hand_b, cell_elements);
 
-    // Quick best move for A at initial state (capped by --max-depth if provided)
-    let remaining0 = 9 - initial.board.filled_count();
-    let eff_depth0 = match args.max_depth {
-        Some(cap) => remaining0.min(cap),
-        None => remaining0,
-    };
-    let mut quick_tt = InMemoryTT::default();
-    let (best_val0, best_mv0, _nodes0) = search_root(&initial, &cards, eff_depth0, &mut quick_tt);
-    println!(
-        "[precompute] Initial best (depth={}): value={}, best_move={}",
-        eff_depth0,
-        best_val0,
-        match best_mv0 {
-            Some(m) => format!("{{ card_id: {}, cell: {} }}", m.card_id, m.cell),
-            None => "None".to_string(),
+    let key = zobrist_key(&gs);
+    println!("[query] Key {:032x}", key);
+
+    match map.get(&key) {
+        Some(entry) => {
+            println!(
+                "[query] Found: value={}, depth={}, best_move={}",
+                entry.value,
+                entry.depth,
+                match entry.best_move {
+                    Some(mv) => format!("{{ card_id: {}, cell: {} }}", mv.card_id, mv.cell),
+                    None => "None".to_string(),
+                }
+            );
         }
-    );
+        None => {
+            println!("[query] Not found in DB");
+        }
+    }
 
-    // Run precompute
-    let (db_map, stats) = precompute_solve(&initial, &cards, elements_mode, args.max_depth);
-    let elapsed = t0.elapsed();
-
-    // Compose header
-    let header = DbHeader {
-        version: triplecargo::persist::FORMAT_VERSION,
-        rules,
-        elements_mode,
-        seed: args.seed,
-        start_player: Owner::A,
-        hands_a: hand_a,
-        hands_b: hand_b,
-        cards_fingerprint: fingerprint_cards(&cards),
-    };
-
-    // Save
-    save_db(&args.out, &header, &db_map)
-        .map_err(|e| format!("Save error: {e}"))?;
-
-    println!(
-        "[precompute] Done. exact_entries={}, nodes={}, states_enumerated={}, roots={}, max_depth={:?}, elapsed_ms={}",
-        stats.exact_entries, stats.nodes, stats.states_enumerated, stats.roots, args.max_depth, elapsed.as_millis()
-    );
-    println!(
-        "[precompute] Initial key {:032x}",
-        zobrist_key(&initial)
-    );
+    // Optional: compare with stored header metadata
+    if header.elements_mode != elements_mode {
+        eprintln!(
+            "[query] Warning: DB elements_mode {:?} differs from query {:?}",
+            header.elements_mode, elements_mode
+        );
+    }
+    if header.seed != args.seed && header.elements_mode == ElementsMode::Random {
+        eprintln!(
+            "[query] Warning: DB seed {} differs from query seed {}",
+            header.seed, args.seed
+        );
+    }
 
     Ok(())
 }

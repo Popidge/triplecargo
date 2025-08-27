@@ -1,85 +1,113 @@
 use crate::rules::Rules;
 use crate::state::GameState;
+use crate::types::Owner;
 
-/// Simple SplitMix64-based mixer to build a deterministic 128-bit key without precomputed tables.
+/// SplitMix64 PRNG step for stable, fast token generation.
 #[inline]
 fn splitmix64(mut x: u64) -> u64 {
-    x = x.wrapping_add(0x9E3779B97F4A7C15);
+    x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
     let mut z = x;
-    z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
     z ^ (z >> 31)
 }
 
 #[inline]
-fn mix_into(acc_a: &mut u64, acc_b: &mut u64, data: u64, salt: u64) {
-    let m1 = splitmix64(data ^ salt);
-    let m2 = splitmix64(m1 ^ 0xA5A5_A5A5_A5A5_A5A5);
-    *acc_a ^= m1.rotate_left(17);
-    *acc_b = acc_b.rotate_left(13) ^ m2;
+fn token128_from_seed(seed: u64) -> u128 {
+    // Two rounds to build 128 bits deterministically.
+    let lo = splitmix64(seed ^ 0xC0FF_EE00_D15E_CAFE);
+    let hi = splitmix64(seed ^ 0xDEAD_BEEF_F00D_FACE ^ lo.rotate_left(17));
+    ((hi as u128) << 64) | (lo as u128)
 }
 
-/// Returns a u128 Zobrist-like key for memoisation.
-/// Components:
-/// - Board slots with (idx, owner, card_id)
-/// - Hands as unordered multisets per player (each present card_id contributes once)
-/// - Next player
-/// - Rule toggles bitfield
-#[inline]
-pub fn zobrist_key(state: &GameState) -> u128 {
-    let mut a: u64 = 0xC0FF_EE00_D15E_CAFE;
-    let mut b: u64 = 0xDEAD_BEEF_F00D_FACE;
+// Domain tags (arbitrary but fixed)
+const DOM_BOARD: u64 = 0xB0A2_1D5E_0000_0001;
+const DOM_HAND:  u64 = 0xB0A2_1D5E_0000_00A0;
+const DOM_NEXT:  u64 = 0xB0A2_1D5E_0000_00C0;
+const DOM_RULES: u64 = 0xB0A2_1D5E_0000_00D0;
 
-    // Board
+/// Public Zobrist tokens for incremental maintenance
+
+#[inline]
+pub fn z_token_board(cell: u8, owner: Owner, card_id: u16) -> u128 {
+    let owner_bit: u64 = match owner {
+        Owner::A => 0,
+        Owner::B => 1,
+    };
+    let seed = DOM_BOARD
+        ^ (cell as u64)
+        ^ (owner_bit << 8)
+        ^ ((card_id as u64) << 16);
+    token128_from_seed(seed)
+}
+
+#[inline]
+pub fn z_token_hand(owner: Owner, card_id: u16) -> u128 {
+    let owner_bit: u64 = match owner {
+        Owner::A => 0,
+        Owner::B => 1,
+    };
+    let seed = DOM_HAND ^ owner_bit ^ ((card_id as u64) << 8);
+    token128_from_seed(seed)
+}
+
+#[inline]
+pub fn z_token_next(owner: Owner) -> u128 {
+    let owner_bit: u64 = match owner {
+        Owner::A => 0,
+        Owner::B => 1,
+    };
+    let seed = DOM_NEXT ^ owner_bit;
+    token128_from_seed(seed)
+}
+
+#[inline]
+pub fn z_token_rules(rules: Rules) -> u128 {
+    let toggles: u64 = (rules.elemental as u64)
+        | ((rules.same as u64) << 1)
+        | ((rules.plus as u64) << 2)
+        | ((rules.same_wall as u64) << 3);
+    let seed = DOM_RULES ^ toggles;
+    token128_from_seed(seed)
+}
+
+/// Full recomputation from state components. Used to initialize and to validate
+/// incremental updates during tests.
+#[inline]
+pub fn recompute_zobrist(state: &GameState) -> u128 {
+    let mut z: u128 = 0;
+
+    // Board occupants
     for idx in 0u8..9 {
         if let Some(slot) = state.board.get(idx) {
-            let owner_bit: u64 = match slot.owner {
-                crate::types::Owner::A => 0,
-                crate::types::Owner::B => 1,
-            };
-            let data = (idx as u64)
-                | (owner_bit << 8)
-                | ((slot.card_id as u64) << 16)
-                | (0x01u64 << 63); // domain tag: board
-            mix_into(&mut a, &mut b, data, 0xB0A2_1D5E_0000_0001);
+            z ^= z_token_board(idx, slot.owner, slot.card_id);
         }
     }
 
-    // Hands (unordered): each present card contributes
-    for slot in state.hands_a {
-        if let Some(id) = slot {
-            let data = (id as u64) | (0x02u64 << 60); // domain: hand A
-            mix_into(&mut a, &mut b, data, 0xB0A2_1D5E_0000_00A0);
+    // Hands as unordered multisets
+    for s in state.hands_a {
+        if let Some(id) = s {
+            z ^= z_token_hand(Owner::A, id);
         }
     }
-    for slot in state.hands_b {
-        if let Some(id) = slot {
-            let data = (id as u64) | (0x03u64 << 60); // domain: hand B
-            mix_into(&mut a, &mut b, data, 0xB0A2_1D5E_0000_00B0);
+    for s in state.hands_b {
+        if let Some(id) = s {
+            z ^= z_token_hand(Owner::B, id);
         }
     }
 
-    // Next player
-    let next_bit: u64 = match state.next {
-        crate::types::Owner::A => 0,
-        crate::types::Owner::B => 1,
-    };
-    let data = next_bit | (0x04u64 << 60);
-    mix_into(&mut a, &mut b, data, 0xB0A2_1D5E_0000_00C0);
+    // Side to move
+    z ^= z_token_next(state.next);
 
     // Rules toggles
-    let Rules {
-        elemental,
-        same,
-        plus,
-        same_wall,
-    } = state.rules;
-    let toggles: u64 = (elemental as u64)
-        | ((same as u64) << 1)
-        | ((plus as u64) << 2)
-        | ((same_wall as u64) << 3);
-    let data = toggles | (0x05u64 << 60);
-    mix_into(&mut a, &mut b, data, 0xB0A2_1D5E_0000_00D0);
+    z ^= z_token_rules(state.rules);
 
-    ((a as u128) << 64) | (b as u128)
+    z
+}
+
+/// Accessor kept for API stability: now returns the cached, incrementally
+/// maintained key stored in GameState.
+#[inline]
+pub fn zobrist_key(state: &GameState) -> u128 {
+    state.zobrist
 }

@@ -1,43 +1,52 @@
 use crate::board::Board;
 use crate::rules::Rules;
 use crate::types::{Element, Owner};
+use serde::{Deserialize, Serialize};
+use crate::hash::recompute_zobrist;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Move {
     pub card_id: u16,
     pub cell: u8, // 0..=8
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GameState {
     pub board: Board,
     pub hands_a: [Option<u16>; 5],
     pub hands_b: [Option<u16>; 5],
     pub next: Owner,
     pub rules: Rules,
+    pub zobrist: u128,
 }
 
 impl GameState {
     #[inline]
     pub fn new_empty(rules: Rules) -> Self {
-        Self {
+        let mut s = Self {
             board: Board::new(),
             hands_a: [None; 5],
             hands_b: [None; 5],
             next: Owner::A,
             rules,
-        }
+            zobrist: 0,
+        };
+        s.zobrist = recompute_zobrist(&s);
+        s
     }
 
     #[inline]
     pub fn with_elements(rules: Rules, cell_elements: [Option<Element>; 9]) -> Self {
-        Self {
+        let mut s = Self {
             board: Board::from_elements(cell_elements),
             hands_a: [None; 5],
             hands_b: [None; 5],
             next: Owner::A,
             rules,
-        }
+            zobrist: 0,
+        };
+        s.zobrist = recompute_zobrist(&s);
+        s
     }
 
     #[inline]
@@ -54,6 +63,7 @@ impl GameState {
         };
         s.hands_a = hand_a.map(Some);
         s.hands_b = hand_b.map(Some);
+        s.zobrist = recompute_zobrist(&s);
         s
     }
 

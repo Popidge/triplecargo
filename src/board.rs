@@ -6,7 +6,7 @@ pub struct Slot {
     pub card_id: u16,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Board {
     // Cells 0..=8 laid out row-major (r*3 + c)
     cells: [Option<Slot>; 9],

@@ -1,5 +1,5 @@
 use crate::cards::CardsDb;
-use crate::engine::apply::apply_move;
+use crate::engine::apply::{apply_move, make_move, unmake_move};
 use crate::engine::score::score;
 use crate::hash::zobrist_key;
 use crate::state::{is_terminal, legal_moves, GameState, Move};
@@ -24,12 +24,13 @@ pub fn negamax(state: &GameState, cards: &CardsDb, _limits: SearchLimits, tt: &m
 /// Returns (value, best_move, nodes).
 pub fn search_root(state: &GameState, cards: &CardsDb, depth: u8, tt: &mut dyn TranspositionTable) -> (i8, Option<Move>, u64) {
     let mut nodes: u64 = 0;
-
+    let mut scratch = state.clone();
+ 
     // Terminal shortcut
-    if is_terminal(state) {
-        let val = terminal_value(state);
+    if is_terminal(&scratch) {
+        let val = terminal_value(&scratch);
         tt.put(
-            zobrist_key(state),
+            zobrist_key(&scratch),
             TTEntry {
                 value: val,
                 depth: 0,
@@ -39,25 +40,32 @@ pub fn search_root(state: &GameState, cards: &CardsDb, depth: u8, tt: &mut dyn T
         );
         return (val, None, nodes);
     }
-
-    let key = zobrist_key(state);
+ 
+    let key = zobrist_key(&scratch);
     let mut tt_best: Option<Move> = None;
     if let Some(entry) = tt.get(key) {
+        // Early-out at root: if we already have an Exact at sufficient depth
+        if entry.depth >= depth {
+            if let Bound::Exact = entry.flag {
+                return (entry.value, entry.best_move, nodes);
+            }
+        }
         tt_best = entry.best_move;
     }
-
-    let mut moves = legal_moves(state);
+ 
+    let mut moves = legal_moves(&scratch);
     order_moves(&mut moves, tt_best);
-
+ 
     let mut alpha = ALPHA_INIT;
     let beta = BETA_INIT;
-
+ 
     let mut best_val = ALPHA_INIT;
     let mut best_move: Option<Move> = None;
-
+ 
     for mv in moves {
-        if let Ok(ns) = apply_move(state, cards, mv) {
-            let val = -negamax_inner(&ns, depth.saturating_sub(1), -beta, -alpha, tt, cards, &mut nodes);
+        if let Ok(undo) = make_move(&mut scratch, cards, mv) {
+            let val = -negamax_inner(&mut scratch, depth.saturating_sub(1), -beta, -alpha, tt, cards, &mut nodes);
+            unmake_move(&mut scratch, undo);
             if val > best_val {
                 best_val = val;
                 best_move = Some(mv);
@@ -70,7 +78,7 @@ pub fn search_root(state: &GameState, cards: &CardsDb, depth: u8, tt: &mut dyn T
             }
         }
     }
-
+ 
     // Store root as Exact with chosen best move
     tt.put(
         key,
@@ -81,12 +89,12 @@ pub fn search_root(state: &GameState, cards: &CardsDb, depth: u8, tt: &mut dyn T
             best_move,
         },
     );
-
+ 
     (best_val, best_move, nodes)
 }
 
 fn negamax_inner(
-    state: &GameState,
+    state: &mut GameState,
     depth: u8,
     mut alpha: i8,
     mut beta: i8,
@@ -95,7 +103,7 @@ fn negamax_inner(
     nodes: &mut u64,
 ) -> i8 {
     *nodes += 1;
-
+ 
     // Terminal or depth limit
     if is_terminal(state) {
         let val = terminal_value(state);
@@ -113,10 +121,10 @@ fn negamax_inner(
     if depth == 0 {
         return terminal_value(state);
     }
-
+ 
     let key = zobrist_key(state);
     let mut tt_best: Option<Move> = None;
-
+ 
     // TT probe
     if let Some(entry) = tt.get(key) {
         if entry.depth >= depth {
@@ -139,33 +147,32 @@ fn negamax_inner(
         }
         tt_best = entry.best_move;
     }
-
+ 
     // Generate and order moves
     let mut moves = legal_moves(state);
     order_moves(&mut moves, tt_best);
-
+ 
     let alpha_orig = alpha;
     let mut best_val = ALPHA_INIT;
     let mut best_mv: Option<Move> = None;
-
+ 
     for mv in moves {
-        let ns = match apply_move(state, cards, mv) {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
-        let val = -negamax_inner(&ns, depth - 1, -beta, -alpha, tt, cards, nodes);
-        if val > best_val {
-            best_val = val;
-            best_mv = Some(mv);
-        }
-        if best_val > alpha {
-            alpha = best_val;
-        }
-        if alpha >= beta {
-            break;
+        if let Ok(undo) = make_move(state, cards, mv) {
+            let val = -negamax_inner(state, depth - 1, -beta, -alpha, tt, cards, nodes);
+            unmake_move(state, undo);
+            if val > best_val {
+                best_val = val;
+                best_mv = Some(mv);
+            }
+            if best_val > alpha {
+                alpha = best_val;
+            }
+            if alpha >= beta {
+                break;
+            }
         }
     }
-
+ 
     // Determine bound type for storage
     let flag = if best_val <= alpha_orig {
         Bound::Upper
@@ -174,7 +181,7 @@ fn negamax_inner(
     } else {
         Bound::Exact
     };
-
+ 
     tt.put(
         key,
         TTEntry {
@@ -184,7 +191,7 @@ fn negamax_inner(
             best_move: best_mv,
         },
     );
-
+ 
     best_val
 }
 

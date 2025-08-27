@@ -13,7 +13,7 @@ pub enum Element {
     Ice,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Owner {
     A,
     B,
