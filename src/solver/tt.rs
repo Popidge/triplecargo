@@ -1,11 +1,22 @@
 use std::collections::HashMap;
 
-/// Minimal entry for a transposition table. For now we only keep the exact value.
-/// Later we can extend with depth, bound type, best move, etc.
+use crate::state::Move;
+
+/// Bound type used for alpha-beta aware TT entries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Bound {
+    Exact,
+    Lower, // value is a lower bound (alpha)
+    Upper, // value is an upper bound (beta)
+}
+
+/// Transposition table entry storing value bounds, depth, and the best move for ordering/PV.
 #[derive(Debug, Clone, Copy)]
 pub struct TTEntry {
-    pub value: i8,   // exact game-theoretic value from the perspective of player to move
-    pub depth: u8,   // remaining depth when stored (for replacement policy)
+    pub value: i8,            // value from side-to-move perspective
+    pub depth: u8,            // remaining search depth when stored
+    pub flag: Bound,          // Exact / Lower / Upper
+    pub best_move: Option<Move>,
 }
 
 pub trait TranspositionTable {
@@ -15,7 +26,7 @@ pub trait TranspositionTable {
     fn len(&self) -> usize;
 }
 
-/// Simple in-memory hash map implementation (stub friendly).
+/// Simple in-memory hash map implementation with depth-preferred replacement.
 #[derive(Debug, Default)]
 pub struct InMemoryTT {
     map: HashMap<u128, TTEntry>,
@@ -36,8 +47,14 @@ impl TranspositionTable for InMemoryTT {
 
     #[inline]
     fn put(&mut self, key: u128, entry: TTEntry) {
-        // Simple store; replacement strategy can be added later (e.g., deeper depth wins)
-        self.map.insert(key, entry);
+        // Depth-preferred replacement: replace if new.depth >= old.depth
+        let replace = match self.map.get(&key) {
+            Some(old) => entry.depth >= old.depth,
+            None => true,
+        };
+        if replace {
+            self.map.insert(key, entry);
+        }
     }
 
     #[inline]

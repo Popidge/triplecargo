@@ -76,5 +76,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // Run solver on current state
+    {
+        use triplecargo::solver::Solver;
+        let remaining = 9u8 - state.board.filled_count();
+        let mut solver = Solver::new(remaining);
+        let res = solver.search(&state, &cards);
+        println!(
+            "[solver] depth={} nodes={} value={} (side-to-move)",
+            res.depth, res.nodes, res.value
+        );
+        if let Some(bm) = res.best_move {
+            println!("[solver] best_move: card {} at cell {}", bm.card_id, bm.cell);
+        } else {
+            println!("[solver] no legal moves (terminal).");
+        }
+        if !res.principal_variation.is_empty() {
+            let pv_str = res
+                .principal_variation
+                .iter()
+                .map(|m| format!("{}@{}", m.card_id, m.cell))
+                .collect::<Vec<_>>()
+                .join(" ");
+            println!("[solver] PV: {}", pv_str);
+        }
+    }
+
     Ok(())
 }

@@ -187,6 +187,34 @@ Not implemented yet (prepared via stubs and structure):
 - Memory layout: fixed arrays and small value types along hot paths to support future exhaustive search performance.
 
 
+## Solver (Negamax + αβ + TT)
+
+The project includes a full-depth, deterministic solver based on Negamax with alpha–beta pruning and a transposition table (TT).
+
+- Value convention: side-to-move perspective using i8. At terminal, score is A−B; if next is B, the terminal value is negated.
+- Search depth: 9 − filled_count (full remaining plies).
+- Transposition table: depth-preferred replacement with bounds (Exact/Lower/Upper) and optional best_move for ordering/PV.
+- Deterministic move ordering: Corners > Edges > Center; then cell index; then card id. If TT provides a best_move, it is tried first.
+
+Files
+- Facade, limits, and SearchResult: [src/solver/mod.rs](src/solver/mod.rs)
+- Negamax + αβ + TT and PV reconstruction: [src/solver/negamax.rs](src/solver/negamax.rs)
+- Transposition table (Bound, TTEntry, InMemoryTT): [src/solver/tt.rs](src/solver/tt.rs)
+- Move ordering heuristics: [src/solver/move_order.rs](src/solver/move_order.rs)
+- CLI demo integration: [src/bin/tt-cli.rs](src/bin/tt-cli.rs)
+- Tests for solver correctness and determinism: [tests/solver_tests.rs](tests/solver_tests.rs)
+
+Usage outline
+- Construct a GameState and load cards as usual.
+- Instantiate a Solver and call its search method to get best move, value, PV, nodes, and depth. See [src/solver/mod.rs](src/solver/mod.rs) for the facade and [src/bin/tt-cli.rs](src/bin/tt-cli.rs) for a demonstration.
+
+Determinism
+- Stable move ordering and cascades, stable hashing ([src/hash.rs](src/hash.rs)), and depth-preferred TT replacement provide reproducible results.
+
+Testing
+- Engine tests continue to verify rules and determinism.
+- Additional tests exercise solver terminal values and determinism: [tests/solver_tests.rs](tests/solver_tests.rs).
+
 ## License
 
 The code in this repository is provided under an open license to be decided for distribution. If you intend to redistribute or use parts of it, ensure to add an explicit license file and headers as appropriate for your project or organisation.
