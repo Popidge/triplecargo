@@ -11,7 +11,8 @@ Deterministic, high‑performance Rust implementation of the Final Fantasy VIII 
 Goals
 - Correct, complete game engine with configurable rules
 - Deterministic and allocation‑free hot paths suitable for exhaustive search
-- Stubs for solver and precompute phases prepared for future milestones
+- Full solver implemented (Negamax + αβ + TT) with deterministic move ordering and PV
+- Precompute phase stub prepared for future milestone
 
 
 ## Project layout
@@ -27,15 +28,18 @@ Core modules
 - State hashing for memoisation: [src/hash.rs](src/hash.rs)
 - Public surface and re‑exports: [src/lib.rs](src/lib.rs)
 
-Solver and precompute stubs
-- Solver module facade and limits: [src/solver/mod.rs](src/solver/mod.rs)
-- Negamax placeholder with memoisation hook: [src/solver/negamax.rs](src/solver/negamax.rs)
-- Transposition table trait and in‑memory impl: [src/solver/tt.rs](src/solver/tt.rs)
+Solver and precompute
+- Solver module facade, limits, and SearchResult: [src/solver/mod.rs](src/solver/mod.rs)
+- Negamax with αβ pruning, TT integration, and PV reconstruction: [src/solver/negamax.rs](src/solver/negamax.rs)
+- Transposition table (Bound, TTEntry, depth‑preferred replacement): [src/solver/tt.rs](src/solver/tt.rs)
+- Deterministic move ordering heuristics: [src/solver/move_order.rs](src/solver/move_order.rs)
 
 Binaries and tests
 - CLI demo: [src/bin/tt-cli.rs](src/bin/tt-cli.rs)
 - Precompute driver stub: [src/bin/precompute.rs](src/bin/precompute.rs)
 - Engine tests: [tests/engine_tests.rs](tests/engine_tests.rs)
+- Solver tests: [tests/solver_tests.rs](tests/solver_tests.rs)
+- Rule edge tests (Same, Same Wall, Plus, Combo, allocation assertions): [tests/rule_edge_tests.rs](tests/rule_edge_tests.rs)
 
 
 ## Data model (high level)
@@ -145,26 +149,27 @@ See:
 
 ## Testing scope
 
-The test suite in [tests/engine_tests.rs](tests/engine_tests.rs) currently verifies:
+Engine tests: [tests/engine_tests.rs](tests/engine_tests.rs)
 - Legal move ordering determinism
 - Basic capture strictness (no flips on ties, flips on strictly greater)
 - Elemental adjustments (same element +1 with cap 10; different or no element −1 with floor 1) applied to both placed and neighbor cards based on their own cells
 - End‑to‑end progression to terminal state and scoring integrity
 
-Planned additions:
-- Focused tests for Same (including Same Wall), Plus, and Combo edge cases
-- Zero‑allocation assertions on hot paths in debug builds where applicable
-- Cross‑rule interaction tests when multiple toggles are enabled simultaneously
+Rule edge tests: [tests/rule_edge_tests.rs](tests/rule_edge_tests.rs)
+- Same triggers flipping of all matched opponent neighbors
+- Same Wall contributes equality at value 10; walls do not flip
+- Plus triggers double flips when two sums match; walls excluded
+- Combo cascades apply Basic rule only from newly flipped neighbors (deterministic BFS)
+- Zero‑allocation assertion: legal_moves preallocates exact capacity to avoid reallocation
+
+Solver tests: [tests/solver_tests.rs](tests/solver_tests.rs)
+- Terminal value correctness from side‑to‑move perspective
+- Determinism: identical value and principal variation across runs for the same state
 
 
 ## Roadmap and future milestones
 
 Not implemented yet (prepared via stubs and structure):
-- Solver
-  - Negamax with alpha‑beta and memoisation
-  - Exact values under perfect play
-  - Move ordering heuristics and TT replacement policy
-  - Verification against a Python reference solver
 - Precomputation
   - Full enumeration of reachable states for typical card pools/rule sets
   - Bulk solve and caching of outcomes
