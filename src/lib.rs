@@ -9,6 +9,7 @@ pub mod board;
 pub mod state;
 pub mod hash;
 pub mod persist;
+pub mod persist_stream;
 
 pub mod engine {
     pub mod apply;

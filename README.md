@@ -1,230 +1,188 @@
-# Triplecargo — Triple Triad Engine (FF8)
-
-Deterministic, high‑performance Rust implementation of the Final Fantasy VIII Triple Triad ruleset, designed to support perfect play solving, full state-space precomputation, and instant best‑move queries.
-
-- Core language: Rust 2021
-- Rule toggles: Elemental, Same, Plus, Same Wall (independent switches)
-- Determinism: Fixed move ordering, deterministic cascades, reproducible state hashing
-- Data source: [data/cards.json](data/cards.json)
-- Library‑first design with small binaries for CLI and precompute
-
-Goals
-- Correct, complete game engine with configurable rules
-- Deterministic and allocation‑free hot paths suitable for exhaustive search
-- Full solver implemented (Negamax + αβ + TT) with deterministic move ordering and PV
-- Precompute phase stub prepared for future milestone
+♠️ Triplecargo — Triple Triad Assistant & Solver (FF8)
 
 
-## Project layout
-
-Core modules
-- Types and shared enums: [src/types.rs](src/types.rs)
-- Rule toggles configuration: [src/rules.rs](src/rules.rs)
-- Cards loader and DB: [src/cards.rs](src/cards.rs)
-- Board representation and neighbors: [src/board.rs](src/board.rs)
-- Game state and legal moves: [src/state.rs](src/state.rs)
-- Engine — rule application and cascades: [src/engine/apply.rs](src/engine/apply.rs)
-- Engine — scoring: [src/engine/score.rs](src/engine/score.rs)
-- State hashing for memoisation: [src/hash.rs](src/hash.rs)
-- Public surface and re‑exports: [src/lib.rs](src/lib.rs)
-
-Solver and precompute
-- Solver module facade, limits, and SearchResult: [src/solver/mod.rs](src/solver/mod.rs)
-- Negamax with αβ pruning, TT integration, and PV reconstruction: [src/solver/negamax.rs](src/solver/negamax.rs)
-- Transposition table (Bound, TTEntry, depth‑preferred replacement): [src/solver/tt.rs](src/solver/tt.rs)
-- Deterministic move ordering heuristics: [src/solver/move_order.rs](src/solver/move_order.rs)
-
-Binaries and tests
-- CLI demo: [src/bin/tt-cli.rs](src/bin/tt-cli.rs)
-- Precompute driver stub: [src/bin/precompute.rs](src/bin/precompute.rs)
-- Engine tests: [tests/engine_tests.rs](tests/engine_tests.rs)
-- Solver tests: [tests/solver_tests.rs](tests/solver_tests.rs)
-- Rule edge tests (Same, Same Wall, Plus, Combo, allocation assertions): [tests/rule_edge_tests.rs](tests/rule_edge_tests.rs)
+Deterministic, high‑performance Rust implementation of the Final Fantasy VIII Triple Triad ruleset, designed to support:
 
 
-## Data model (high level)
-
-- Cards: Loaded at runtime from [data/cards.json](data/cards.json). Each card has top/right/bottom/left side values 1–10 and an optional element. JSON validation enforces side ranges and uniqueness by id and name.
-- Board: 3×3 grid stored as a fixed 9‑slot array with optional occupant and optional per‑cell element. Deterministic neighbor order: Up, Right, Down, Left.
-- Hands: Each player starts with 5 cards (no duplicates in a hand). Current implementation stores hands as fixed small arrays with Option slots for removed cards.
-- Next player: Owner A or B, toggles each move.
-- Rules: Independent boolean toggles for elemental, same, plus, same_wall with spec defaults set to off.
+- Perfect play solving (Negamax + αβ + TT).
+- Full state‑space precomputation for instant queries.
+- Analysis experiments (first‑player advantage, card ratings, rule impacts).
+- AI/ML integration for lightweight move suggestion and imperfect‑information play.
+Triplecargo is both a research‑grade solver and the foundation for a superhuman Triple Triad assistant — combining exact computation with modern AI techniques.
 
 
-## Rules implemented
+---
 
-Core structure
-- Players: 2 (A and B)
-- Board: 3×3, 9 turns total, first player defaults to A
-- Hands: 5 cards each, one placement per turn, alternate turns
+✨ Features
 
-Basic capture
-- When a card is placed, compare its touching side against each orthogonally adjacent opponent card’s touching side.
-- If the placed card’s side is strictly greater, the neighbor flips to the placer’s ownership.
-- In the absence of Same/Plus flips, only the placed card can flip neighbors and there is no cascade.
+- Full ruleset: Basic, Elemental, Same, Plus, Same Wall, Combo cascades.
+- Deterministic engine: fixed move ordering, reproducible cascades, stable hashing.
+- High‑performance solver: Negamax + αβ pruning + transposition table.
+- Precompute driver: bulk solve all reachable states for a given hand/ruleset.
+- Persistence: append‑only batch writes, deterministic compaction, optional compression, checkpoint/resume.
+- Analysis mode: RAM‑only runs for experiments (no I/O bottleneck).
+- Throughput: ~10M nodes/sec, ~1M states/sec on a Ryzen 3600.
+- Training data export (JSONL): trajectory or full state‑space, policy_format onehot|mcts, deterministic with fixed seed.
 
-Elemental (toggle)
-- Some board cells may have an element.
-- For each card on an elemental cell:
-  - If the card has the same element: all sides +1 (capped at 10).
-  - If the card has a different element: all sides −1 (floored at 1).
-  - If the card has no element: all sides −1 (floored at 1).
-- If the cell has no element: no change.
-- Adjustments apply to both the placed card and any neighbors, each relative to the element of the cell they occupy.
+---
 
-Same (toggle)
-- If two or more sides of the placed card are equal to the touching sides of adjacent opponent cards, all those matched neighbors flip.
+📂 Project layout
 
-Same Wall (toggle)
-- If enabled, treat the board edge as a “wall” with value 10 for Same equality checks only.
-- If the placed card’s side equals 10 and matches a wall, it contributes one equality toward the Same trigger.
-- Walls never flip and are not considered for any other rule.
+- Core engine: rules, state, hashing, scoring.
+- Solver: negamax + αβ + TT, PV reconstruction.
+- Precompute: state enumeration, parallel solve, persistence.
+- Persistence: batch writes, compression, checkpointing.
+- Binaries:
+	- tt-cli: demo CLI.
+	- precompute: bulk solver + DB writer.
+- Tests: engine correctness, rule edge cases, solver determinism.
 
-Plus (toggle)
-- If the sum of the placed card’s side and an opponent neighbor’s touching side equals the sum of the placed card’s side and another opponent neighbor’s touching side, both those neighbors flip.
-- Only opponent neighbors are considered; walls are excluded from Plus.
+---
 
-Combo / cascades
-- If Same or Plus flips occur, enqueue those newly flipped cards and process a cascade:
-  - For each dequeued newly flipped card, apply the Basic greater‑than rule to its neighbors.
-  - Cascades repeat until no more flips.
-  - Important: cascades use only the Basic rule, not Same/Plus again.
+🧮 Data model
 
-Scoring and end of game
-- After 9 turns, all cells are filled.
-- Score = (#A owned) − (#B owned).
-- Positive score: A wins; negative: B wins; zero: draw.
+- Cards: loaded from data/cards.json, validated for ranges and uniqueness.
+- Board: 3×3 fixed array, optional per‑cell element.
+- Hands: 5 cards per player (engine: fixed arrays; export: shrinking lists as cards are played).
+- Rules: independent toggles for Elemental, Same, Plus, Same Wall.
+- Hashing: XOR‑based Zobrist, incremental updates, 128‑bit keys.
 
+---
+ 
+📤 Training data export (JSONL)
+ 
+- Modes (via precompute):
+  - --export-mode trajectory (default): exports a single 9‑state principal‑variation trajectory per sampled game.
+  - --export-mode full: exports the entire reachable state space for one sampled hand pair (exhaustive).
+- Determinism:
+  - --seed controls sampling (hands/elements) and, if mcts is selected, the rollout RNG; same seed + flags → identical output lines.
+- Hand sampling:
+  - --hand-strategy random: uniform without replacement from all 110 cards.
+  - --hand-strategy stratified: one card from each level band [1–2], [3–4], [5–6], [7–8], [9–10].
+- Elements:
+  - --elements none|random with deterministic per‑game element RNG when random is chosen.
+- Policy targets:
+  - --policy-format onehot (default): one‑hot over legal moves, best move probability = 1.0, others = 0.0.
+  - --policy-format mcts: shallow, deterministic MCTS at root; --mcts-rollouts N (default 100) controls simulations; outputs soft distribution over legal moves.
+- JSONL writing:
+  - Lines are appended as they are generated (streaming), with periodic flushes; no buffering of entire games.
+ 
+CLI examples
+- Trajectory export (one‑hot), 10 games, no elements:
+  - target/release/precompute --export export.jsonl --export-mode trajectory --games 10 --seed 42 --hand-strategy random --rules none --elements none --policy-format onehot
+- Trajectory export (MCTS with 256 rollouts), stratified hands, with Elemental+Same:
+  - target/release/precompute --export export_mcts.jsonl --export-mode trajectory --games 10 --seed 42 --hand-strategy stratified --rules elemental,same --elements random --policy-format mcts --mcts-rollouts 256
+- Full state‑space export (exhaustive):
+  - target/release/precompute --export export_full.jsonl --export-mode full --seed 42 --hand-strategy random --rules none --elements none
+ 
+JSONL schema
+Each line contains one state:
+ 
+{
+  "board": [
+    {"cell":0,"card_id":12,"owner":"A"},
+    {"cell":1,"card_id":null,"owner":null},
+    ...
+  ],
+  "hands": {
+    "A": [34,56,78,90],     // shrinking lists (5 → 0 across a trajectory)
+    "B": [22,33,44,55]
+  },
+  "to_move": "A",
+  "turn": 2,
+  "rules": {
+    "elemental": false,
+    "same": false,
+    "plus": false,
+    "same_wall": false
+  },
+  "policy_target": {
+    "34-0": 1.0,            // key = "card_id-cell", prob in [0,1]
+    "56-1": 0.0
+  },
+  "value_target": 1         // minimax value from side‑to‑move perspective
+}
+ 
+Notes
+- In trajectory mode, the solver searches full remaining depth at each ply to produce value_target consistent with final outcome.
+- In full mode, enumeration exports all reachable states for the single sampled hand pair (useful for analysis).
 
-## Determinism and performance
+🕹️ Rules implemented
 
-- Deterministic move ordering: legal moves are generated first by ascending board index, then by ascending card id in the current player’s hand.
-- Deterministic cascade order: BFS queue over newly flipped indices sorted ascending to ensure reproducible cascade sequences.
-- Elemental adjustments are computed per occupant per cell before comparisons; strictly greater/tie behavior is consistent and deterministic.
-- Hot path is allocation‑free aside from small, bounded temporaries; core data structures are fixed‑size arrays for cache locality.
-- State hashing returns a 128‑bit key produced from the board, the unordered hands, next player bit, and rule toggles for stable memoisation across runs. See [src/hash.rs](src/hash.rs).
+- Basic capture: placed card flips weaker adjacent opponents.
+- Elemental: +1/−1 adjustments based on cell element.
+- Same: 2+ equalities trigger flips.
+- Same Wall: walls count as 10 for Same.
+- Plus: equal sums trigger flips.
+- Combo: cascades apply Basic rule only.
 
+---
 
-## Elements and cards
+⚡ Performance & determinism
 
-Elements supported (matching JSON): Earth, Fire, Water, Poison, Holy, Thunder, Wind, Ice.
+- Move ordering: Corners > Edges > Center, then cell index, then card id.
+- Cascade order: BFS queue, ascending indices.
+- TT: fixed‑size array, depth‑preferred replacement, full key verification.
+- Progress: MultiProgress bars, states/sec, nodes/sec.
+- Determinism: same state → same result, reproducible DBs.
 
-Cards are loaded at runtime from [data/cards.json](data/cards.json). The loader validates side ranges (1..=10), ensures unique ids and names, and builds:
-- Dense id index for O(1) fetch by id
-- Name‑to‑id map for direct lookups (case‑sensitive, as stored)
+---
 
+🔮 Roadmap
 
-## Building, testing, and running
+Near‑term
 
-Prerequisites
-- Rust toolchain (stable recommended)
+- Query API: CLI/HTTP service for instant best‑move lookups from solved DBs.
+- Analysis experiments:
+	- First‑player advantage quantification.
+	- Card/hand Elo ratings.
+	- Elemental variance studies.
+	- Rule interaction balance.
 
-Build and test
-- Run unit tests:
-  - cargo test
+Mid‑term
 
-Run the CLI demo (loads JSON, constructs simple hands, applies a scripted sequence, prints board and score):
-- cargo run --bin tt-cli
+- AI/ML integration:
+	- NPZ export option for compact storage.
+	- PyTorch Dataset utilities to load JSONL → tensors.
+	- Train small policy/value nets for lightweight move suggestion.
+	- Reinforced self‑play (AlphaZero‑lite) to refine policies.
+- Imperfect‑info play:
+	- Expectimax/MCTS with hidden hands.
+	- Opponent modelling.
 
-Run the precompute stub (demonstrates enumerating states and computing keys, without solving/persisting yet):
-- cargo run --bin precompute
+Long‑term
 
+- Superhuman assistant:
+	- Instant move suggestions in Open and Closed formats.
+	- Configurable playstyles: Optimal, Robust, Exploitative.
+	- Human‑like play modes for fun.
+- Meta‑analysis:
+	- “Best hand” search for each ruleset.
+	- Card tier lists and balance insights.
+	- Quantitative impact of Elemental RNG.
 
-## Public usage
+---
 
-This crate exposes a minimal, stable surface that re‑exports types and helpers from the internal modules via [src/lib.rs](src/lib.rs). Typical external usage flow:
-- Load cards from [data/cards.json](data/cards.json)
-- Construct a game state (empty, with elements, or with hands)
-- Enumerate legal moves deterministically
-- Apply a move to get a new state
-- Compute the score or check for terminal state
-- Compute a zobrist‑like key for memoisation
+🧪 Testing scope
 
-See:
-- State and legal moves: [src/state.rs](src/state.rs)
-- Move application (rules): [src/engine/apply.rs](src/engine/apply.rs)
-- Scoring: [src/engine/score.rs](src/engine/score.rs)
-- Hashing: [src/hash.rs](src/hash.rs)
+- Engine tests: rule correctness, determinism, allocation‑free hot paths.
+- Solver tests: terminal values, PV determinism.
+- Rule edge tests: Same, Plus, Same Wall, Combo cascades.
+- Persistence tests: batch flush, compression, checkpoint/resume determinism.
 
+---
 
-## Testing scope
-
-Engine tests: [tests/engine_tests.rs](tests/engine_tests.rs)
-- Legal move ordering determinism
-- Basic capture strictness (no flips on ties, flips on strictly greater)
-- Elemental adjustments (same element +1 with cap 10; different or no element −1 with floor 1) applied to both placed and neighbor cards based on their own cells
-- End‑to‑end progression to terminal state and scoring integrity
-
-Rule edge tests: [tests/rule_edge_tests.rs](tests/rule_edge_tests.rs)
-- Same triggers flipping of all matched opponent neighbors
-- Same Wall contributes equality at value 10; walls do not flip
-- Plus triggers double flips when two sums match; walls excluded
-- Combo cascades apply Basic rule only from newly flipped neighbors (deterministic BFS)
-- Zero‑allocation assertion: legal_moves preallocates exact capacity to avoid reallocation
-
-Solver tests: [tests/solver_tests.rs](tests/solver_tests.rs)
-- Terminal value correctness from side‑to‑move perspective
-- Determinism: identical value and principal variation across runs for the same state
-
-
-## Roadmap and future milestones
-
-Not implemented yet (prepared via stubs and structure):
-- Precomputation
-  - Full enumeration of reachable states for typical card pools/rule sets
-  - Bulk solve and caching of outcomes
-- Persistence
-  - On‑disk database for solved states (format TBD)
-  - Loader that maps solved DB into memory for instant queries
-- Query API
-  - Fast CLI or HTTP service that returns best moves from solved DB
-- Analysis
-  - Experiments for first‑player advantage, card ratings, rule interactions
-
-
-## Design notes and decisions
-
-- Reproducibility first: move order and cascade order are pinned; hashing is stable; default starting player is A.
-- Modular toggles: Elemental, Same, Plus, and Same Wall are represented independently; they can be combined arbitrarily and are evaluated exactly as per the specification.
-- Elemental semantics: When a cell has an element and the card does not, the card’s sides are reduced by 1 (floored at 1). On a non‑elemental cell, there is no adjustment.
-- Walls participate only in Same when Same Wall is enabled, contributing equality at value 10; walls never flip and never participate in Plus.
-- Basic rule is the only rule used during cascades; Same/Plus never re‑trigger within a cascade.
-- Memory layout: fixed arrays and small value types along hot paths to support future exhaustive search performance.
-
-
-## Solver (Negamax + αβ + TT)
-
-The project includes a full-depth, deterministic solver based on Negamax with alpha–beta pruning and a transposition table (TT).
-
-- Value convention: side-to-move perspective using i8. At terminal, score is A−B; if next is B, the terminal value is negated.
-- Search depth: 9 − filled_count (full remaining plies).
-- Transposition table: depth-preferred replacement with bounds (Exact/Lower/Upper) and optional best_move for ordering/PV.
-- Deterministic move ordering: Corners > Edges > Center; then cell index; then card id. If TT provides a best_move, it is tried first.
-
-Files
-- Facade, limits, and SearchResult: [src/solver/mod.rs](src/solver/mod.rs)
-- Negamax + αβ + TT and PV reconstruction: [src/solver/negamax.rs](src/solver/negamax.rs)
-- Transposition table (Bound, TTEntry, InMemoryTT): [src/solver/tt.rs](src/solver/tt.rs)
-- Move ordering heuristics: [src/solver/move_order.rs](src/solver/move_order.rs)
-- CLI demo integration: [src/bin/tt-cli.rs](src/bin/tt-cli.rs)
-- Tests for solver correctness and determinism: [tests/solver_tests.rs](tests/solver_tests.rs)
-
-Usage outline
-- Construct a GameState and load cards as usual.
-- Instantiate a Solver and call its search method to get best move, value, PV, nodes, and depth. See [src/solver/mod.rs](src/solver/mod.rs) for the facade and [src/bin/tt-cli.rs](src/bin/tt-cli.rs) for a demonstration.
-
-Determinism
-- Stable move ordering and cascades, stable hashing ([src/hash.rs](src/hash.rs)), and depth-preferred TT replacement provide reproducible results.
-
-Testing
-- Engine tests continue to verify rules and determinism.
-- Additional tests exercise solver terminal values and determinism: [tests/solver_tests.rs](tests/solver_tests.rs).
-
-## License
-
-The code in this repository is provided under an open license to be decided for distribution. If you intend to redistribute or use parts of it, ensure to add an explicit license file and headers as appropriate for your project or organisation.
+📜 License
 
 
-## Acknowledgements
+The code in this repository is provided under an open license (TBD).
+Triple Triad belongs to Square Enix (Final Fantasy VIII). This is a clean‑room reimplementation for research and educational purposes.
 
-Triple Triad belongs to Square Enix (Final Fantasy VIII). This repository provides a clean‑room implementation of the game rules for research and educational purposes, including AI search and game analysis.
+
+---
+
+🙏 Acknowledgements
+
+- FF8’s Triple Triad ruleset by Square Enix.
+- Chess/Go engine design patterns (negamax, αβ, Zobrist, TT).
+- OpenAI GPT‑5 + Kilo Code for collaborative design and implementation.
