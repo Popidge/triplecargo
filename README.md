@@ -50,62 +50,87 @@ Triplecargo is both a research‑grade solver and the foundation for a superhuma
 ---
  
 📤 Training data export (JSONL)
- 
+
 - Modes (via precompute):
   - --export-mode trajectory (default): exports a single 9‑state principal‑variation trajectory per sampled game.
   - --export-mode full: exports the entire reachable state space for one sampled hand pair (exhaustive).
+
 - Determinism:
-  - --seed controls sampling (hands/elements) and, if mcts is selected, the rollout RNG; same seed + flags → identical output lines.
+  - --seed controls sampling (hands/elements) and, if mcts is selected, the rollout RNG.
+  - Same seed + flags → identical JSONL output (including Elemental layout and policy targets).
+
+- Value targets:
+  - --value-mode winloss (default): sign(value) from side‑to‑move perspective ∈ {-1, 0, +1}.
+  - --value-mode margin: final A‑perspective score margin (A_cards − B_cards) ∈ [-9, +9].
+
 - Hand sampling:
   - --hand-strategy random: uniform without replacement from all 110 cards.
   - --hand-strategy stratified: one card from each level band [1–2], [3–4], [5–6], [7–8], [9–10].
+
 - Elements:
   - --elements none|random with deterministic per‑game element RNG when random is chosen.
+  - Element letter codes on export: F (Fire), I (Ice), T (Thunder), W (Water), E (Earth), P (Poison), H (Holy), L (Wind).
+
 - Policy targets:
-  - --policy-format onehot (default): one‑hot over legal moves, best move probability = 1.0, others = 0.0.
-  - --policy-format mcts: shallow, deterministic MCTS at root; --mcts-rollouts N (default 100) controls simulations; outputs soft distribution over legal moves.
+  - --policy-format onehot (default): exported as a single move object {"card_id":..., "cell":...}.
+  - --policy-format mcts: exported as a {"cardId-cell": prob} distribution over legal moves; --mcts-rollouts N (default 100) controls simulations.
+  - In terminal states: onehot → policy_target omitted (null), mcts → {} empty map.
+
 - JSONL writing:
   - Lines are appended as they are generated (streaming), with periodic flushes; no buffering of entire games.
- 
+
 CLI examples
-- Trajectory export (one‑hot), 10 games, no elements:
-  - target/release/precompute --export export.jsonl --export-mode trajectory --games 10 --seed 42 --hand-strategy random --rules none --elements none --policy-format onehot
-- Trajectory export (MCTS with 256 rollouts), stratified hands, with Elemental+Same:
-  - target/release/precompute --export export_mcts.jsonl --export-mode trajectory --games 10 --seed 42 --hand-strategy stratified --rules elemental,same --elements random --policy-format mcts --mcts-rollouts 256
-- Full state‑space export (exhaustive):
-  - target/release/precompute --export export_full.jsonl --export-mode full --seed 42 --hand-strategy random --rules none --elements none
- 
+- Trajectory export (onehot), 10 games, no elements:
+  - target/release/precompute --export export.jsonl --export-mode trajectory --games 10 --seed 42 --hand-strategy random --rules none --elements none --policy-format onehot --value-mode winloss
+- Trajectory export (MCTS with 256 rollouts), stratified hands, with Elemental+Same and margin targets:
+  - target/release/precompute --export export_mcts.jsonl --export-mode trajectory --games 10 --seed 42 --hand-strategy stratified --rules elemental,same --elements random --policy-format mcts --mcts-rollouts 256 --value-mode margin
+- Full state‑space export (exhaustive) for one sampled hand pair:
+  - target/release/precompute --export export_full.jsonl --export-mode full --seed 42 --hand-strategy random --rules none --elements none --policy-format onehot --value-mode winloss
+
 JSONL schema
-Each line contains one state:
- 
+Each line contains one state. Fields:
+
 {
+  "game_id": 12,                // sequential per sampled game (trajectory); full mode uses 0
+  "state_idx": 0,               // 0..8 within a game trajectory (equals "turn")
   "board": [
-    {"cell":0,"card_id":12,"owner":"A"},
-    {"cell":1,"card_id":null,"owner":null},
-    ...
+    {"cell":0,"card_id":12,"owner":"A","element":"F"}, // element present only when rules.elemental=true; otherwise omitted
+    {"cell":1,"card_id":null,"owner":null,"element":null},
+    {"cell":2,"card_id":null,"owner":null,"element":"W"}
   ],
   "hands": {
-    "A": [34,56,78,90],     // shrinking lists (5 → 0 across a trajectory)
-    "B": [22,33,44,55]
+    "A": [34,56,78,90,11],      // shrinking lists (5 → 0 across a trajectory)
+    "B": [22,33,44,55,66]
   },
   "to_move": "A",
-  "turn": 2,
+  "turn": 0,
   "rules": {
-    "elemental": false,
-    "same": false,
+    "elemental": true,
+    "same": true,
     "plus": false,
     "same_wall": false
   },
-  "policy_target": {
-    "34-0": 1.0,            // key = "card_id-cell", prob in [0,1]
-    "56-1": 0.0
-  },
-  "value_target": 1         // minimax value from side‑to‑move perspective
+
+  // Policy target semantics:
+  // onehot → single best move object:
+  //   "policy_target": {"card_id":34,"cell":0}
+  // mcts → distribution over legal moves:
+  //   "policy_target": {"34-0":0.7,"56-1":0.3}
+  "policy_target": {"34-0": 0.7, "56-1": 0.3},
+
+  // Value target semantics controlled by --value-mode:
+  // - winloss → {-1,0,+1} from side-to-move perspective (sign of solver value)
+  // - margin  → integer margin A_cards − B_cards (A-perspective)
+  "value_target": 1,
+  "value_mode": "winloss",
+
+  // 128-bit Zobrist hash of the state (hex string)
+  "state_hash": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4"
 }
- 
+
 Notes
 - In trajectory mode, the solver searches full remaining depth at each ply to produce value_target consistent with final outcome.
-- In full mode, enumeration exports all reachable states for the single sampled hand pair (useful for analysis).
+- In full mode, enumeration exports all reachable states for the single sampled hand pair (useful for analysis). For mcts in full mode, rollout RNG is derived from (seed XOR state Zobrist) for traversal‑order invariance.
 
 🕹️ Rules implemented
 

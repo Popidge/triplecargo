@@ -39,10 +39,17 @@ enum ExportModeOpt {
     Trajectory,
     Full,
 }
+
 #[derive(Debug, Clone, ValueEnum)]
 enum PolicyFormatOpt {
     Onehot,
     Mcts,
+}
+
+#[derive(Debug, Clone, ValueEnum)]
+enum ValueModeOpt {
+    Winloss,
+    Margin,
 }
 
 #[derive(Debug, Parser)]
@@ -104,6 +111,9 @@ struct Args {
     #[arg(long, default_value_t = 100)]
     mcts_rollouts: usize,
 
+    /// Value target mode: winloss | margin
+    #[arg(long, value_enum, default_value_t = ValueModeOpt::Winloss)]
+    value_mode: ValueModeOpt,
 
     /// Batch flush size for streaming persistence
     #[arg(long, default_value_t = 100_000)]
@@ -228,6 +238,9 @@ struct BoardCell {
     cell: u8,
     card_id: Option<u16>,
     owner: Option<char>, // 'A' | 'B'
+    // Present only when rules.elemental = true; inner None serializes to null
+    #[serde(skip_serializing_if = "Option::is_none")]
+    element: Option<Option<char>>,
 }
 
 #[derive(Serialize)]
@@ -239,20 +252,28 @@ struct HandsRecord {
 }
 
 #[derive(Serialize)]
-struct PolicyTarget {
-   card_id: u16,
-   cell: u8,
+#[serde(untagged)]
+enum PolicyOut {
+   // onehot
+   Move { card_id: u16, cell: u8 },
+   // mcts
+   Dist(BTreeMap<String, f32>),
 }
 
 #[derive(Serialize)]
 struct ExportRecord {
+   game_id: usize,
+   state_idx: u8,
    board: Vec<BoardCell>,
    hands: HandsRecord,
    to_move: char,
    turn: u8,
    rules: Rules,
-   policy_target: BTreeMap<String, f32>,
+   #[serde(skip_serializing_if = "Option::is_none")]
+   policy_target: Option<PolicyOut>,
    value_target: i8,
+   value_mode: String,
+   state_hash: String,
 }
 
 fn all_card_ids_sorted(cards: &triplecargo::CardsDb) -> Vec<u16> {
@@ -299,10 +320,53 @@ fn sample_hand_stratified(bands: &mut [Vec<u16>; 5], rng: &mut u64) -> [u16; 5] 
    hand
 }
 
+// Element to letter mapping required by spec: F, I, T, W, E, P, H, L
+#[inline]
+fn element_letter(e: Element) -> char {
+    match e {
+        Element::Fire => 'F',
+        Element::Ice => 'I',
+        Element::Thunder => 'T',
+        Element::Water => 'W',
+        Element::Earth => 'E',
+        Element::Poison => 'P',
+        Element::Holy => 'H',
+        Element::Wind => 'L',
+    }
+}
+
+#[inline]
+fn value_mode_str(vm: &ValueModeOpt) -> &'static str {
+    match vm {
+        ValueModeOpt::Winloss => "winloss",
+        ValueModeOpt::Margin => "margin",
+    }
+}
+
+#[inline]
+fn compute_value_target(vm: &ValueModeOpt, side_value: i8, to_move: Owner) -> i8 {
+    match vm {
+        ValueModeOpt::Winloss => {
+            if side_value > 0 { 1 } else if side_value < 0 { -1 } else { 0 }
+        }
+        ValueModeOpt::Margin => {
+            // Convert side-to-move perspective to A-perspective absolute margin
+            match to_move {
+                Owner::A => side_value,
+                Owner::B => -side_value,
+            }
+        }
+    }
+}
+
 fn enumerate_solved_records(
    initial: &GameState,
    cards: &triplecargo::CardsDb,
    max_depth: Option<u8>,
+   policy_format: PolicyFormatOpt,
+   value_mode: ValueModeOpt,
+   mcts_rollouts: usize,
+   base_seed: u64,
 ) -> Vec<ExportRecord> {
    let mut out: Vec<ExportRecord> = Vec::new();
    let mut visited: hashbrown::HashSet<u128> = hashbrown::HashSet::default();
@@ -328,28 +392,23 @@ fn enumerate_solved_records(
        HandsRecord { a: ha, b: hb }
    }
 
-   fn build_onehot_policy_map(state: &GameState, bm: Option<triplecargo::Move>) -> BTreeMap<String, f32> {
-       let mut map = BTreeMap::new();
-       let moves = legal_moves(state);
-       for mv in moves {
-           let key = format!("{}-{}", mv.card_id, mv.cell);
-           let p = if Some(mv) == bm { 1.0 } else { 0.0 };
-           map.insert(key, p);
-       }
-       map
-   }
-
    fn push_record(
        state: &GameState,
        cards: &triplecargo::CardsDb,
        tt: &mut InMemoryTT,
        cap: Option<u8>,
        out: &mut Vec<ExportRecord>,
+       policy_format: &PolicyFormatOpt,
+       value_mode: &ValueModeOpt,
+       mcts_rollouts: usize,
+       base_seed: u64,
    ) {
        let depth = eff_depth_for(state, cap);
        let (val, bm, _nodes) = search_root(state, cards, depth, tt);
 
+       // Build board cells with optional elemental letters
        let mut board_vec: Vec<BoardCell> = Vec::with_capacity(9);
+       let elemental_enabled = state.rules.elemental;
        for cell in 0u8..9 {
            let slot = state.board.get(cell);
            let (card_id, owner) = match slot {
@@ -359,23 +418,43 @@ fn enumerate_solved_records(
                })),
                None => (None, None),
            };
-           board_vec.push(BoardCell { cell, card_id, owner });
+           let element_field: Option<Option<char>> = if elemental_enabled {
+               Some(state.board.cell_element(cell).map(element_letter))
+           } else {
+               None
+           };
+           board_vec.push(BoardCell { cell, card_id, owner, element: element_field });
        }
 
-       let policy = build_onehot_policy_map(state, bm);
-       let hands = collect_hands_from_state(state);
+       // Policy output
+       let policy_out: Option<PolicyOut> = match policy_format {
+           PolicyFormatOpt::Onehot => {
+               bm.map(|m| PolicyOut::Move { card_id: m.card_id, cell: m.cell })
+           }
+           PolicyFormatOpt::Mcts => {
+               // Deterministic per-state seed
+               let z = zobrist_key(state);
+               let seed = base_seed ^ (z as u64) ^ ((z >> 64) as u64);
+               let dist = mcts_policy_distribution(state, cards, mcts_rollouts, seed);
+               Some(PolicyOut::Dist(dist))
+           }
+       };
 
+       let hands = collect_hands_from_state(state);
+       let to_move = match state.next { Owner::A => 'A', Owner::B => 'B' };
+       let vt = compute_value_target(value_mode, val, state.next);
        let rec = ExportRecord {
+           game_id: 0,
+           state_idx: state.board.filled_count(),
            board: board_vec,
            hands,
-           to_move: match state.next {
-               Owner::A => 'A',
-               Owner::B => 'B',
-           },
+           to_move,
            turn: state.board.filled_count(),
            rules: state.rules,
-           policy_target: policy,
-           value_target: val,
+           policy_target: policy_out,
+           value_target: vt,
+           value_mode: value_mode_str(value_mode).to_string(),
+           state_hash: format!("{:032x}", zobrist_key(state)),
        };
        out.push(rec);
    }
@@ -387,12 +466,16 @@ fn enumerate_solved_records(
        visited: &mut hashbrown::HashSet<u128>,
        cap: Option<u8>,
        out: &mut Vec<ExportRecord>,
+       policy_format: &PolicyFormatOpt,
+       value_mode: &ValueModeOpt,
+       mcts_rollouts: usize,
+       base_seed: u64,
    ) {
        let key = zobrist_key(state);
        if !visited.insert(key) {
            return;
        }
-       push_record(state, cards, tt, cap, out);
+       push_record(state, cards, tt, cap, out, policy_format, value_mode, mcts_rollouts, base_seed);
 
        if state.is_terminal() {
            return;
@@ -400,12 +483,12 @@ fn enumerate_solved_records(
        let moves = legal_moves(state);
        for mv in moves {
            if let Ok(ns) = apply_move(state, cards, mv) {
-               dfs(&ns, cards, tt, visited, cap, out);
+               dfs(&ns, cards, tt, visited, cap, out, policy_format, value_mode, mcts_rollouts, base_seed);
            }
        }
    }
 
-   dfs(initial, cards, &mut tt, &mut visited, max_depth, &mut out);
+   dfs(initial, cards, &mut tt, &mut visited, max_depth, &mut out, &policy_format, &value_mode, mcts_rollouts, base_seed);
    out
 }
 
@@ -544,8 +627,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ExportModeOpt::Trajectory => {
                 let games = args.games;
                 println!(
-                    "[export] Mode=trajectory games={} hand_strategy={:?} seed={:#x}",
-                    games, args.hand_strategy, args.seed
+                    "[export] Mode=trajectory games={} hand_strategy={:?} seed={:#x} policy_format={:?} value_mode={:?}",
+                    games, args.hand_strategy, args.seed, args.policy_format, args.value_mode
                 );
 
                 let mut total_lines: usize = 0;
@@ -586,18 +669,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     for _ply in 0..9 {
                         // In trajectory mode we always search full remaining depth to obtain final-outcome value targets.
                         let eff_depth = 9 - state.board.filled_count();
-        
+
                         let (val, bm, _nodes) = search_root(&state, &cards, eff_depth, &mut tt);
 
                         // Serialize current state record
                         let mut board_vec: Vec<BoardCell> = Vec::with_capacity(9);
+                        let elemental_enabled = state.rules.elemental;
                         for cell in 0u8..9 {
                             let slot = state.board.get(cell);
                             let (card_id, owner) = match slot {
                                 Some(s) => (Some(s.card_id), Some(match s.owner { Owner::A => 'A', Owner::B => 'B' })),
                                 None => (None, None),
                             };
-                            board_vec.push(BoardCell { cell, card_id, owner });
+                            let element_field: Option<Option<char>> = if elemental_enabled {
+                                Some(state.board.cell_element(cell).map(element_letter))
+                            } else {
+                                None
+                            };
+                            board_vec.push(BoardCell { cell, card_id, owner, element: element_field });
                         }
                         // Build shrinking-hands snapshot for current state
                         let mut hands_a_vec: Vec<u16> = Vec::with_capacity(5);
@@ -606,33 +695,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         for &o in state.hands_b.iter() { if let Some(id) = o { hands_b_vec.push(id); } }
                         let hands_rec = HandsRecord { a: hands_a_vec, b: hands_b_vec };
 
-                        // Build policy distribution based on requested format
-                        let policy_map: BTreeMap<String, f32> = match args.policy_format {
+                        // Build policy output based on requested format
+                        let policy_out: Option<PolicyOut> = match args.policy_format {
                             PolicyFormatOpt::Onehot => {
-                                let mut m = BTreeMap::new();
-                                let moves = legal_moves(&state);
-                                for mv in moves {
-                                    let key = format!("{}-{}", mv.card_id, mv.cell);
-                                    let p = if Some(mv) == bm { 1.0 } else { 0.0 };
-                                    m.insert(key, p);
-                                }
-                                m
+                                bm.map(|m| PolicyOut::Move { card_id: m.card_id, cell: m.cell })
                             }
                             PolicyFormatOpt::Mcts => {
-                                // Seed per ply for determinism
+                                // Seed per ply for determinism (trajectory keeps legacy per-ply seeding)
                                 let seed_for_rollouts = splitmix64(&mut rng_state);
-                                mcts_policy_distribution(&state, &cards, args.mcts_rollouts, seed_for_rollouts)
+                                let dist = mcts_policy_distribution(&state, &cards, args.mcts_rollouts, seed_for_rollouts);
+                                Some(PolicyOut::Dist(dist))
                             }
                         };
 
+                        let to_move = match state.next { Owner::A => 'A', Owner::B => 'B' };
+                        let vt = compute_value_target(&args.value_mode, val, state.next);
+
                         let rec = ExportRecord {
+                            game_id: i,
+                            state_idx: state.board.filled_count(),
                             board: board_vec,
                             hands: hands_rec,
-                            to_move: match state.next { Owner::A => 'A', Owner::B => 'B' },
+                            to_move,
                             turn: state.board.filled_count(),
                             rules: state.rules,
-                            policy_target: policy_map,
-                            value_target: val,
+                            policy_target: policy_out,
+                            value_target: vt,
+                            value_mode: value_mode_str(&args.value_mode).to_string(),
+                            state_hash: format!("{:032x}", zobrist_key(&state)),
                         };
                         let line = serde_json::to_string(&rec).map_err(|e| format!("serialize JSONL record error: {e}"))?;
                         writer.write_all(line.as_bytes()).map_err(|e| format!("export write error: {e}"))?;
@@ -670,8 +760,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ExportModeOpt::Full => {
                 // One hand pair only; ignore --games
                 println!(
-                    "[export] Mode=full (ignoring --games). hand_strategy={:?} seed={:#x}",
-                    args.hand_strategy, args.seed
+                    "[export] Mode=full (ignoring --games). hand_strategy={:?} seed={:#x} policy_format={:?} value_mode={:?}",
+                    args.hand_strategy, args.seed, args.policy_format, args.value_mode
                 );
 
                 let mut rng_state: u64 = args.seed;
@@ -700,11 +790,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 let initial = GameState::with_hands(rules, hand_a, hand_b, cell_elements);
 
-                // Full enumeration as before
-                let records = enumerate_solved_records(&initial, &cards, args.max_depth);
+                // Full enumeration with new schema/options
+                let records = enumerate_solved_records(
+                    &initial,
+                    &cards,
+                    args.max_depth,
+                    args.policy_format.clone(),
+                    args.value_mode.clone(),
+                    args.mcts_rollouts,
+                    args.seed, // base seed for per-state MCTS seeding
+                );
 
                 let mut total_lines: usize = 0;
-                for rec in records {
+                for mut rec in records {
+                    // Ensure game_id and state_idx contract for full mode
+                    rec.game_id = 0;
+                    // state_idx already equals turn in construction
                     let line = serde_json::to_string(&rec).map_err(|e| format!("serialize JSONL record error: {e}"))?;
                     writer.write_all(line.as_bytes()).map_err(|e| format!("export write error: {e}"))?;
                     writer.write_all(b"\n").map_err(|e| format!("export write error: {e}"))?;
