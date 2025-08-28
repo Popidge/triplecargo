@@ -132,6 +132,62 @@ Notes
 - In trajectory mode, the solver searches full remaining depth at each ply to produce value_target consistent with final outcome.
 - In full mode, enumeration exports all reachable states for the single sampled hand pair (useful for analysis). For mcts in full mode, rollout RNG is derived from (seed XOR state Zobrist) for traversal‑order invariance.
 
+📑 Export Semantics
+
+- 
+State timing
+
+
+	- Each JSONL line represents the state before a move is made.
+	- At turn = t, the board has t occupied cells, and the side in to_move is about to play their (t+1)‑th card.
+	- Hands shrink accordingly, but at the final turn = 8 there is still one card left in the mover’s hand and a policy_target showing where it will be placed.
+- 
+Policy targets
+
+
+	- --policy-format onehot:
+		- Exported as a single move object:
+
+	"policy_target": {"card_id": 34, "cell": 0}
+
+
+
+	- --policy-format mcts:
+		- Exported as a distribution over legal moves:
+
+	"policy_target": {"34-0": 0.7, "56-1": 0.3}
+
+
+
+	- Terminal states:
+		- onehot → policy_target omitted (null).
+		- mcts → empty map {}.
+- 
+Value targets
+
+
+	- Controlled by --value-mode:
+		- winloss: value ∈ {-1, 0, +1}, always from the side‑to‑move perspective.
+			- +1 = side‑to‑move wins under perfect play.
+			- 0 = draw.
+			- −1 = side‑to‑move loses.
+		- margin: integer final score difference (A_cards − B_cards), always from A’s perspective, independent of side‑to‑move.
+	- Values are computed by solving the full remaining depth at each ply, so they are consistent with the final outcome.
+- 
+Elemental layout
+
+
+	- When rules.elemental = true, each board cell includes an "element" field with one of:
+		- "F" (Fire), "I" (Ice), "T" (Thunder), "W" (Water), "E" (Earth), "P" (Poison), "H" (Holy), "L" (Wind).
+	- Otherwise, the "element" field is omitted.
+- 
+Metadata
+
+
+	- game_id: sequential per sampled game in trajectory mode; fixed 0 in full mode.
+	- state_idx: 0..8 within a trajectory (equals turn).
+	- state_hash: 128‑bit Zobrist hash of the state, hex string.
+
 🕹️ Rules implemented
 
 - Basic capture: placed card flips weaker adjacent opponents.
