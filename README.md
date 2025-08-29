@@ -56,6 +56,9 @@ Core flags
   - --export PATH                JSONL output file
   - --export-mode trajectory|full
   - --games N                    number of games (trajectory mode only; full mode ignores this)
+- Parallelism and scheduling
+  - --threads N                  number of worker threads (default: available_parallelism()-1, min 1)
+  - --chunk-size N               number of games each worker fetches at once; if omitted, defaults to min(32, max(1, floor(games/threads))); affects scheduling only
 - Sampling and determinism
   - --seed U64                   master seed; controls hand sampling, per-ply RNG (off-PV), and MCTS rollouts
   - --hand-strategy random|stratified
@@ -88,6 +91,28 @@ Parallel export (worker + writer) — TASK T7
   - Tests: --games 10 produces 90 lines; output compared equal across thread counts.
 - Progress:
   - The trajectory export includes an indicatif ProgressBar with a background updater that reports states/sec, nodes/sec, ETA, and policy info.
+
+Chunked scheduling — TASK T9
+- New CLI flag: --chunk-size N (dynamic default).
+- Default behaviour when --chunk-size is omitted:
+  - effective_chunk_size = min(32, max(1, floor(games/threads))).
+  - This keeps small runs snappy (smaller chunks) while avoiding excessive overhead on large runs (cap at 32).
+- Scheduling model:
+  - Each worker requests N games at a time (a "chunk") from a deterministic round‑robin dispatcher.
+  - Mapping is round‑based: in round r, worker w processes chunk index (r * workers + w).
+  - For a chunk index k, the assigned game_id range is [k*N, min((k+1)*N, games)).
+  - Workers solve games in their chunk sequentially, then proceed to their next round’s chunk.
+- Determinism:
+  - Assignment is a pure function of (worker_id, worker_count, chunk_size), not timing.
+  - The single writer preserves strict increasing game_id order, so JSONL output is byte‑for‑byte identical for the same seed + flags regardless of --chunk-size and --threads.
+  - game_id stability is preserved across different chunk sizes and thread counts.
+- Logging:
+  - At startup, export logs include the configured chunk size:
+    [export] chunk_size=N
+- Trade‑offs:
+  - Larger chunks reduce scheduling overhead and improve locality for per‑worker TT warming.
+  - Smaller chunks can improve tail latency and load balance for heterogeneous workloads.
+  - Chunking affects scheduling only; output content and ordering are unchanged.
 
 Per-worker transposition table — TASK T8
 - Each worker owns a fixed-size, direct-mapped transposition table (no sharing; no locks).

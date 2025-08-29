@@ -3,7 +3,7 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 use std::sync::{mpsc, Arc};
-use std::sync::atomic::{AtomicUsize, Ordering, AtomicU64};
+use std::sync::atomic::{Ordering, AtomicU64};
 use std::time::Instant;
 
 use clap::{Parser, ValueEnum};
@@ -93,7 +93,11 @@ struct Args {
     /// Number of worker threads for export (default: available_parallelism-1, min 1)
     #[arg(long)]
     threads: Option<usize>,
-
+    
+    /// Chunk size per worker request (number of games fetched at once). If omitted, defaults to min(32, max(1, games/threads)).
+    #[arg(long = "chunk-size")]
+    chunk_size: Option<usize>,
+    
     /// Hand sampling strategy: random | stratified
     #[arg(long, value_enum, default_value_t = HandStrategyOpt::Random)]
     hand_strategy: HandStrategyOpt,
@@ -626,6 +630,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "[export] trajectory workers={} (default = available_parallelism-1)",
                 worker_count
             );
+            // Compute effective chunk size when not specified: min(32, max(1, floor(games/threads)))
+            let effective_chunk_size: usize = match args.chunk_size {
+                Some(v) => v.max(1),
+                None => {
+                    let per = (games / worker_count).max(1);
+                    per.min(32)
+                }
+            };
+            println!("[export] chunk_size={}", effective_chunk_size);
 
             // Shared resources
             let cards_arc = Arc::new(cards);
@@ -635,8 +648,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Result channel
             let (res_tx, res_rx) = mpsc::channel::<(usize, Vec<String>)>();
 
-            // Job counter (claim next game index)
-            let job_counter = Arc::new(AtomicUsize::new(0usize));
+            // Chunked dispatcher: deterministic round-robin across workers (no global job counter)
 
             // Move writer + receiver to writer thread to ensure single-writer semantics
             let pb_clone = pb.clone();
@@ -681,7 +693,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let cards_c = Arc::clone(&cards_arc);
                 let bands_c = Arc::clone(&bands_arc);
                 let all_ids_c = Arc::clone(&all_ids_arc);
-                let job_counter = Arc::clone(&job_counter);
                 let nodes_total_c = Arc::clone(&nodes_total);
 
                 let hand_strategy = args.hand_strategy.clone();
@@ -694,6 +705,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let base_seed = args.seed;
                 let max_games = games;
                 let tt_mib = args.tt_bytes;
+                let chunk_size = effective_chunk_size;
 
                 let handle = std::thread::spawn(move || {
                     // Allocate a per-worker FixedTT and keep it warm across all games
@@ -709,158 +721,166 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     );
                     let mut tt = FixedTT::with_capacity_pow2(cap);
 
+                    // Deterministic chunked scheduling: round-robin chunks across workers
+                    let chunk_size = chunk_size.max(1);
+                    let mut round: usize = 0;
                     loop {
-                        let i = job_counter.fetch_add(1, Ordering::SeqCst);
-                        if i >= max_games {
+                        let chunk_idx = round.saturating_mul(worker_count) + worker_id;
+                        let start = chunk_idx.saturating_mul(chunk_size);
+                        if start >= max_games {
                             break;
                         }
-                        // Per-game deterministic RNG
-                        let mut rng_state: u64 = base_seed ^ ((i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
-
-                        // Sample hands deterministically
-                        let (hand_a, hand_b) = match hand_strategy {
-                            HandStrategyOpt::Random => {
-                                let mut pool = (*all_ids_c).clone();
-                                let ha = sample_hand_random(&mut pool, &mut rng_state);
-                                let hb = sample_hand_random(&mut pool, &mut rng_state);
-                                (ha, hb)
-                            }
-                            HandStrategyOpt::Stratified => {
-                                let mut bands = (*bands_c).clone();
-                                let ha = sample_hand_stratified(&mut bands, &mut rng_state);
-                                let hb = sample_hand_stratified(&mut bands, &mut rng_state);
-                                (ha, hb)
-                            }
-                        };
-
-                        // Elements per game
-                        let cell_elements = match elements_opt {
-                            ElementsOpt::None => None,
-                            ElementsOpt::Random => {
-                                let seed_for_elems = splitmix64(&mut rng_state);
-                                Some(gen_elements(seed_for_elems))
-                            }
-                        };
-
-                        let mut state = GameState::with_hands(rules, hand_a, hand_b, cell_elements);
-
-                        // Per-game off-PV activation
-                        let off_pv_game = matches!(off_pv_strategy, OffPvStrategyOpt::Random | OffPvStrategyOpt::Weighted | OffPvStrategyOpt::Mcts)
-                            && off_pv_rate > 0.0
-                            && {
-                                let mut grng = rng_for_state(base_seed, i as u64, 0);
-                                grng.gen::<f32>() < off_pv_rate
-                            };
-
-                        let mut lines: Vec<String> = Vec::with_capacity(9);
-
-                        let mut nodes_sum_local: u64 = 0;
-                        for _ply in 0..9 {
-                            let eff_depth = 9 - state.board.filled_count();
-                            // Always search full remaining depth (trajectory semantics)
-                            let (val, bm, child_vals, nodes) = search_root_with_children(&state, &cards_c, eff_depth, &mut tt);
-                            nodes_sum_local = nodes_sum_local.saturating_add(nodes);
-
-                            // Board vector
-                            let mut board_vec: Vec<BoardCell> = Vec::with_capacity(9);
-                            let elemental_enabled = state.rules.elemental;
-                            for cell in 0u8..9 {
-                                let slot = state.board.get(cell);
-                                let (card_id, owner) = match slot {
-                                    Some(s) => (Some(s.card_id), Some(match s.owner { Owner::A => 'A', Owner::B => 'B' })),
-                                    None => (None, None),
-                                };
-                                let element_field: Option<Option<char>> = if elemental_enabled {
-                                    Some(state.board.cell_element(cell).map(element_letter))
-                                } else {
-                                    None
-                                };
-                                board_vec.push(BoardCell { cell, card_id, owner, element: element_field });
-                            }
-
-                            // Hands snapshot
-                            let mut hands_a_vec: Vec<u16> = Vec::with_capacity(5);
-                            let mut hands_b_vec: Vec<u16> = Vec::with_capacity(5);
-                            for &o in state.hands_a.iter() { if let Some(id) = o { hands_a_vec.push(id); } }
-                            for &o in state.hands_b.iter() { if let Some(id) = o { hands_b_vec.push(id); } }
-                            let hands_rec = HandsRecord { a: hands_a_vec, b: hands_b_vec };
-
-                            // Optional root MCTS distribution cache for off-PV re-use
-                            let mut mcts_root_dist: Option<BTreeMap<String, f32>> = None;
-
-                            // Policy output
-                            let policy_out: Option<PolicyOut> = match policy_format {
-                                PolicyFormatOpt::Onehot => {
-                                    bm.map(|m| PolicyOut::Move { card_id: m.card_id, cell: m.cell })
+                        let end = (start + chunk_size).min(max_games);
+                        for i in start..end {
+                            // Per-game deterministic RNG
+                            let mut rng_state: u64 = base_seed ^ ((i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+    
+                            // Sample hands deterministically
+                            let (hand_a, hand_b) = match hand_strategy {
+                                HandStrategyOpt::Random => {
+                                    let mut pool = (*all_ids_c).clone();
+                                    let ha = sample_hand_random(&mut pool, &mut rng_state);
+                                    let hb = sample_hand_random(&mut pool, &mut rng_state);
+                                    (ha, hb)
                                 }
-                                PolicyFormatOpt::Mcts => {
-                                    let seed_for_rollouts = splitmix64(&mut rng_state);
-                                    let dist = mcts_policy_distribution(&state, &cards_c, mcts_rollouts, seed_for_rollouts);
-                                    mcts_root_dist = Some(dist.clone());
-                                    Some(PolicyOut::Dist(dist))
+                                HandStrategyOpt::Stratified => {
+                                    let mut bands = (*bands_c).clone();
+                                    let ha = sample_hand_stratified(&mut bands, &mut rng_state);
+                                    let hb = sample_hand_stratified(&mut bands, &mut rng_state);
+                                    (ha, hb)
                                 }
                             };
-
-                            let to_move = match state.next { Owner::A => 'A', Owner::B => 'B' };
-                            let vt = compute_value_target(&value_mode, val, state.next);
-
-                            let rec = ExportRecord {
-                                game_id: i,
-                                state_idx: state.board.filled_count(),
-                                board: board_vec,
-                                hands: hands_rec,
-                                to_move,
-                                turn: state.board.filled_count(),
-                                rules: state.rules,
-                                policy_target: policy_out,
-                                value_target: vt,
-                                value_mode: value_mode_str(&value_mode).to_string(),
-                                off_pv: off_pv_game,
-                                state_hash: format!("{:032x}", zobrist_key(&state)),
+    
+                            // Elements per game
+                            let cell_elements = match elements_opt {
+                                ElementsOpt::None => None,
+                                ElementsOpt::Random => {
+                                    let seed_for_elems = splitmix64(&mut rng_state);
+                                    Some(gen_elements(seed_for_elems))
+                                }
                             };
-                            let line = serde_json::to_string(&rec).expect("serialize JSONL record");
-                            lines.push(line);
-
-                            // Choose next move based on off-PV setting
-                            let next_mv = if off_pv_game {
-                                match off_pv_strategy {
-                                    OffPvStrategyOpt::Random => {
-                                        pick_random_non_pv_move(&state, bm, base_seed, i as u64, state.board.filled_count())
+    
+                            let mut state = GameState::with_hands(rules, hand_a, hand_b, cell_elements);
+    
+                            // Per-game off-PV activation
+                            let off_pv_game = matches!(off_pv_strategy, OffPvStrategyOpt::Random | OffPvStrategyOpt::Weighted | OffPvStrategyOpt::Mcts)
+                                && off_pv_rate > 0.0
+                                && {
+                                    let mut grng = rng_for_state(base_seed, i as u64, 0);
+                                    grng.gen::<f32>() < off_pv_rate
+                                };
+    
+                            let mut lines: Vec<String> = Vec::with_capacity(9);
+    
+                            let mut nodes_sum_local: u64 = 0;
+                            for _ply in 0..9 {
+                                let eff_depth = 9 - state.board.filled_count();
+                                // Always search full remaining depth (trajectory semantics)
+                                let (val, bm, child_vals, nodes) = search_root_with_children(&state, &cards_c, eff_depth, &mut tt);
+                                nodes_sum_local = nodes_sum_local.saturating_add(nodes);
+    
+                                // Board vector
+                                let mut board_vec: Vec<BoardCell> = Vec::with_capacity(9);
+                                let elemental_enabled = state.rules.elemental;
+                                for cell in 0u8..9 {
+                                    let slot = state.board.get(cell);
+                                    let (card_id, owner) = match slot {
+                                        Some(s) => (Some(s.card_id), Some(match s.owner { Owner::A => 'A', Owner::B => 'B' })),
+                                        None => (None, None),
+                                    };
+                                    let element_field: Option<Option<char>> = if elemental_enabled {
+                                        Some(state.board.cell_element(cell).map(element_letter))
+                                    } else {
+                                        None
+                                    };
+                                    board_vec.push(BoardCell { cell, card_id, owner, element: element_field });
+                                }
+    
+                                // Hands snapshot
+                                let mut hands_a_vec: Vec<u16> = Vec::with_capacity(5);
+                                let mut hands_b_vec: Vec<u16> = Vec::with_capacity(5);
+                                for &o in state.hands_a.iter() { if let Some(id) = o { hands_a_vec.push(id); } }
+                                for &o in state.hands_b.iter() { if let Some(id) = o { hands_b_vec.push(id); } }
+                                let hands_rec = HandsRecord { a: hands_a_vec, b: hands_b_vec };
+    
+                                // Optional root MCTS distribution cache for off-PV re-use
+                                let mut mcts_root_dist: Option<BTreeMap<String, f32>> = None;
+    
+                                // Policy output
+                                let policy_out: Option<PolicyOut> = match policy_format {
+                                    PolicyFormatOpt::Onehot => {
+                                        bm.map(|m| PolicyOut::Move { card_id: m.card_id, cell: m.cell })
                                     }
-                                    OffPvStrategyOpt::Weighted => {
-                                        pick_weighted_non_pv_move(&child_vals, bm, base_seed, i as u64, state.board.filled_count())
+                                    PolicyFormatOpt::Mcts => {
+                                        let seed_for_rollouts = splitmix64(&mut rng_state);
+                                        let dist = mcts_policy_distribution(&state, &cards_c, mcts_rollouts, seed_for_rollouts);
+                                        mcts_root_dist = Some(dist.clone());
+                                        Some(PolicyOut::Dist(dist))
                                     }
-                                    OffPvStrategyOpt::Mcts => {
-                                        if matches!(policy_format, PolicyFormatOpt::Mcts) {
-                                            let dist_ref = mcts_root_dist.as_ref().expect("mcts_root_dist present");
-                                            pick_mcts_non_pv_move_from_dist(dist_ref, bm, base_seed, i as u64, state.board.filled_count())
-                                        } else {
-                                            let seed_for_mcts_step = splitmix64(&mut rng_state);
-                                            let dist2 = mcts_policy_distribution(&state, &cards_c, mcts_rollouts, seed_for_mcts_step);
-                                            pick_mcts_non_pv_move_from_dist(&dist2, bm, base_seed, i as u64, state.board.filled_count())
+                                };
+    
+                                let to_move = match state.next { Owner::A => 'A', Owner::B => 'B' };
+                                let vt = compute_value_target(&value_mode, val, state.next);
+    
+                                let rec = ExportRecord {
+                                    game_id: i,
+                                    state_idx: state.board.filled_count(),
+                                    board: board_vec,
+                                    hands: hands_rec,
+                                    to_move,
+                                    turn: state.board.filled_count(),
+                                    rules: state.rules,
+                                    policy_target: policy_out,
+                                    value_target: vt,
+                                    value_mode: value_mode_str(&value_mode).to_string(),
+                                    off_pv: off_pv_game,
+                                    state_hash: format!("{:032x}", zobrist_key(&state)),
+                                };
+                                let line = serde_json::to_string(&rec).expect("serialize JSONL record");
+                                lines.push(line);
+    
+                                // Choose next move based on off-PV setting
+                                let next_mv = if off_pv_game {
+                                    match off_pv_strategy {
+                                        OffPvStrategyOpt::Random => {
+                                            pick_random_non_pv_move(&state, bm, base_seed, i as u64, state.board.filled_count())
+                                        }
+                                        OffPvStrategyOpt::Weighted => {
+                                            pick_weighted_non_pv_move(&child_vals, bm, base_seed, i as u64, state.board.filled_count())
+                                        }
+                                        OffPvStrategyOpt::Mcts => {
+                                            if matches!(policy_format, PolicyFormatOpt::Mcts) {
+                                                let dist_ref = mcts_root_dist.as_ref().expect("mcts_root_dist present");
+                                                pick_mcts_non_pv_move_from_dist(dist_ref, bm, base_seed, i as u64, state.board.filled_count())
+                                            } else {
+                                                let seed_for_mcts_step = splitmix64(&mut rng_state);
+                                                let dist2 = mcts_policy_distribution(&state, &cards_c, mcts_rollouts, seed_for_mcts_step);
+                                                pick_mcts_non_pv_move_from_dist(&dist2, bm, base_seed, i as u64, state.board.filled_count())
+                                            }
                                         }
                                     }
-                                }
-                            } else {
-                                bm
-                            };
-
-                            if let Some(mv) = next_mv {
-                                if let Ok(ns) = apply_move(&state, &cards_c, mv) {
-                                    state = ns;
+                                } else {
+                                    bm
+                                };
+    
+                                if let Some(mv) = next_mv {
+                                    if let Ok(ns) = apply_move(&state, &cards_c, mv) {
+                                        state = ns;
+                                    } else {
+                                        break;
+                                    }
                                 } else {
                                     break;
                                 }
-                            } else {
-                                break;
-                            }
-
-                            // Throttled progress update message (in main would need shared state; skip here in worker)
-                        } // ply loop
-
-                        let _ = nodes_total_c.fetch_add(nodes_sum_local, Ordering::Relaxed);
-                        let _ = res_tx.send((i, lines));
-                    } // worker loop
+    
+                                // Throttled progress update message (in main would need shared state; skip here in worker)
+                            } // ply loop
+    
+                            let _ = nodes_total_c.fetch_add(nodes_sum_local, Ordering::Relaxed);
+                            let _ = res_tx.send((i, lines));
+                        } // for i in chunk
+                        round = round.saturating_add(1);
+                    } // chunked worker loop
                 });
                 worker_handles.push(handle);
             }

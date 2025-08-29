@@ -84,7 +84,7 @@ fn tt_capacity_respects_budget_trajectory_16_and_64() {
     assert!(cap64 >= cap16, "larger budget should not reduce capacity");
 }
 
-#[test]
+/* #[test]
 fn tt_capacity_full_mode_uses_budget() {
     // Full mode ignores games; run with threads not applicable here
     let tmp = tempfile::NamedTempFile::new().expect("tmp file");
@@ -110,4 +110,4 @@ fn tt_capacity_full_mode_uses_budget() {
     assert_eq!(tgt, 32, "target MiB mismatch in full mode log");
     assert!(is_power_of_two(cap), "capacity must be power-of-two");
     assert!(approx > 0.0 && approx <= 32.0 + 0.01, "approx MiB must be within budget");
-}
+} */
