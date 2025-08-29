@@ -124,6 +124,9 @@ Each line contains one state. Fields:
   "value_target": 1,
   "value_mode": "winloss",
 
+  // Off-principal-variation sampling flag; true for all lines of off-PV games, false otherwise
+  "off_pv": false,
+
   // 128-bit Zobrist hash of the state (hex string)
   "state_hash": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4"
 }
@@ -163,6 +166,12 @@ Policy targets
 		- onehot → policy_target omitted (null).
 		- mcts → empty map {}.
 - 
+	- Off-PV stepping (strategy=mcts):
+		- When --off-pv-strategy mcts is active:
+			- If --policy-format mcts is selected, the root MCTS distribution computed for policy_target is reused for stepping.
+			- Otherwise, a root MCTS distribution is computed with --mcts-rollouts at each ply using a deterministic per-ply seed.
+			- The PV move’s probability is set to 0 and the distribution is renormalised; the next move is sampled deterministically via a per-ply RNG tied to (seed, game_id, turn).
+			- Fallback: if the PV move had all probability mass (sum of non-PV probs == 0), the highest-probability non-PV move is selected deterministically.
 Value targets
 
 
@@ -186,6 +195,7 @@ Metadata
 
 	- game_id: sequential per sampled game in trajectory mode; fixed 0 in full mode.
 	- state_idx: 0..8 within a trajectory (equals turn).
+	- off_pv: boolean flag indicating off-principal-variation sampling; true for all lines of off-PV games, false otherwise.
 	- state_hash: 128‑bit Zobrist hash of the state, hex string.
 
 🕹️ Rules implemented

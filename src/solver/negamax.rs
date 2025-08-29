@@ -92,6 +92,82 @@ pub fn search_root(state: &GameState, cards: &CardsDb, depth: u8, tt: &mut dyn T
  
     (best_val, best_move, nodes)
 }
+/// Root search that also returns per-child Q values for all legal moves at the root.
+/// Returns (best_value, best_move, child_values[(Move, i8)], nodes).
+pub fn search_root_with_children(
+    state: &GameState,
+    cards: &CardsDb,
+    depth: u8,
+    tt: &mut dyn TranspositionTable,
+) -> (i8, Option<Move>, Vec<(Move, i8)>, u64) {
+    let mut nodes: u64 = 0;
+    let mut scratch = state.clone();
+
+    // Terminal shortcut
+    if is_terminal(&scratch) {
+        let val = terminal_value(&scratch);
+        tt.put(
+            zobrist_key(&scratch),
+            TTEntry {
+                value: val,
+                depth: 0,
+                flag: Bound::Exact,
+                best_move: None,
+            },
+        );
+        return (val, None, Vec::new(), nodes);
+    }
+
+    let key = zobrist_key(&scratch);
+    let mut tt_best: Option<Move> = None;
+    if let Some(entry) = tt.get(key) {
+        // Use TT best move only for ordering; still evaluate children to obtain Q values
+        tt_best = entry.best_move;
+    }
+
+    let mut moves = legal_moves(&scratch);
+    order_moves(&mut moves, tt_best);
+
+    // Evaluate every child independently to obtain Q for all legal moves
+    // Use full bounds for each to avoid cross-sibling pruning eliminating Q visibility.
+    let mut best_val = ALPHA_INIT;
+    let mut best_move: Option<Move> = None;
+    let mut child_vals: Vec<(Move, i8)> = Vec::with_capacity(moves.len());
+
+    for mv in moves {
+        if let Ok(undo) = make_move(&mut scratch, cards, mv) {
+            let val = -negamax_inner(
+                &mut scratch,
+                depth.saturating_sub(1),
+                -BETA_INIT,
+                -ALPHA_INIT,
+                tt,
+                cards,
+                &mut nodes,
+            );
+            unmake_move(&mut scratch, undo);
+
+            child_vals.push((mv, val));
+            if val > best_val {
+                best_val = val;
+                best_move = Some(mv);
+            }
+        }
+    }
+
+    // Store root as Exact with chosen best move
+    tt.put(
+        key,
+        TTEntry {
+            value: best_val,
+            depth,
+            flag: Bound::Exact,
+            best_move,
+        },
+    );
+
+    (best_val, best_move, child_vals, nodes)
+}
 
 fn negamax_inner(
     state: &mut GameState,

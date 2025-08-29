@@ -7,7 +7,7 @@ pub mod move_order;
 pub mod precompute;
 pub mod tt_array;
  
-pub use negamax::{negamax, reconstruct_pv, search_root};
+pub use negamax::{negamax, reconstruct_pv, search_root, search_root_with_children};
 pub use tt::{Bound, InMemoryTT, TranspositionTable, TTEntry};
 pub use precompute::{precompute_solve, PrecomputeStats};
 pub use crate::persist::ElementsMode;

@@ -10,6 +10,7 @@ pub mod state;
 pub mod hash;
 pub mod persist;
 pub mod persist_stream;
+pub mod rng;
 
 pub mod engine {
     pub mod apply;
@@ -27,3 +28,4 @@ pub use crate::rules::Rules;
 pub use crate::state::{is_terminal, legal_moves, GameState, Move};
 pub use crate::types::{Element, Owner};
 pub use crate::board::Board;
+pub use crate::rng::rng_for_state;

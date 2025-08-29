@@ -8,10 +8,11 @@ use clap::{Parser, ValueEnum};
 use rayon::ThreadPoolBuilder;
 use serde::Serialize;
 use serde_json;
+use rand::Rng;
 
 use triplecargo::{
-    load_cards_from_json, zobrist_key, Element, GameState, Owner, Rules, apply_move, legal_moves, score,
-    solver::{precompute_solve, ElementsMode, search_root, InMemoryTT},
+    load_cards_from_json, zobrist_key, Element, GameState, Owner, Rules, apply_move, legal_moves, score, rng_for_state,
+    solver::{precompute_solve, ElementsMode, search_root, search_root_with_children, InMemoryTT},
     persist::{DbHeader, fingerprint_cards},
     persist_stream::{StreamWriter, StreamCompression, compact_stream_to_db_file, compact_stream_with_baseline_to_db_file},
 };
@@ -50,6 +51,13 @@ enum PolicyFormatOpt {
 enum ValueModeOpt {
     Winloss,
     Margin,
+}
+
+#[derive(Debug, Clone, ValueEnum)]
+enum OffPvStrategyOpt {
+    Random,
+    Weighted,
+    Mcts,
 }
 
 #[derive(Debug, Parser)]
@@ -111,8 +119,23 @@ struct Args {
     #[arg(long, default_value_t = 100)]
     mcts_rollouts: usize,
 
+    /// Off-PV sampling rate [0.0..1.0] (0 disables)
+    #[arg(long, default_value_t = 0.0)]
+    off_pv_rate: f32,
+
+    /// Off-PV sampling strategy: random | weighted | mcts
+    #[arg(long, value_enum, default_value_t = OffPvStrategyOpt::Weighted)]
+    off_pv_strategy: OffPvStrategyOpt,
+
     /// Value target mode: winloss | margin
-    #[arg(long, value_enum, default_value_t = ValueModeOpt::Winloss)]
+    #[arg(
+        long = "value-mode",
+        short = 'm',
+        value_enum,
+        default_value_t = ValueModeOpt::Winloss,
+        value_name = "MODE",
+        visible_aliases = ["value_mode", "valuemode", "vm"]
+    )]
     value_mode: ValueModeOpt,
 
     /// Batch flush size for streaming persistence
@@ -273,7 +296,18 @@ struct ExportRecord {
    policy_target: Option<PolicyOut>,
    value_target: i8,
    value_mode: String,
+   off_pv: bool,
    state_hash: String,
+}
+
+#[derive(Debug, Clone)]
+struct ExportConfig {
+    policy_format: PolicyFormatOpt,
+    value_mode: ValueModeOpt,
+    mcts_rollouts: usize,
+    off_pv_rate: f32,
+    off_pv_strategy: OffPvStrategyOpt,
+    base_seed: u64,
 }
 
 fn all_card_ids_sorted(cards: &triplecargo::CardsDb) -> Vec<u16> {
@@ -363,10 +397,7 @@ fn enumerate_solved_records(
    initial: &GameState,
    cards: &triplecargo::CardsDb,
    max_depth: Option<u8>,
-   policy_format: PolicyFormatOpt,
-   value_mode: ValueModeOpt,
-   mcts_rollouts: usize,
-   base_seed: u64,
+   export_cfg: &ExportConfig,
 ) -> Vec<ExportRecord> {
    let mut out: Vec<ExportRecord> = Vec::new();
    let mut visited: hashbrown::HashSet<u128> = hashbrown::HashSet::default();
@@ -398,10 +429,7 @@ fn enumerate_solved_records(
        tt: &mut InMemoryTT,
        cap: Option<u8>,
        out: &mut Vec<ExportRecord>,
-       policy_format: &PolicyFormatOpt,
-       value_mode: &ValueModeOpt,
-       mcts_rollouts: usize,
-       base_seed: u64,
+       export_cfg: &ExportConfig,
    ) {
        let depth = eff_depth_for(state, cap);
        let (val, bm, _nodes) = search_root(state, cards, depth, tt);
@@ -427,22 +455,22 @@ fn enumerate_solved_records(
        }
 
        // Policy output
-       let policy_out: Option<PolicyOut> = match policy_format {
+       let policy_out: Option<PolicyOut> = match export_cfg.policy_format {
            PolicyFormatOpt::Onehot => {
                bm.map(|m| PolicyOut::Move { card_id: m.card_id, cell: m.cell })
            }
            PolicyFormatOpt::Mcts => {
                // Deterministic per-state seed
                let z = zobrist_key(state);
-               let seed = base_seed ^ (z as u64) ^ ((z >> 64) as u64);
-               let dist = mcts_policy_distribution(state, cards, mcts_rollouts, seed);
+               let seed = export_cfg.base_seed ^ (z as u64) ^ ((z >> 64) as u64);
+               let dist = mcts_policy_distribution(state, cards, export_cfg.mcts_rollouts, seed);
                Some(PolicyOut::Dist(dist))
            }
        };
 
        let hands = collect_hands_from_state(state);
        let to_move = match state.next { Owner::A => 'A', Owner::B => 'B' };
-       let vt = compute_value_target(value_mode, val, state.next);
+       let vt = compute_value_target(&export_cfg.value_mode, val, state.next);
        let rec = ExportRecord {
            game_id: 0,
            state_idx: state.board.filled_count(),
@@ -453,7 +481,8 @@ fn enumerate_solved_records(
            rules: state.rules,
            policy_target: policy_out,
            value_target: vt,
-           value_mode: value_mode_str(value_mode).to_string(),
+           value_mode: value_mode_str(&export_cfg.value_mode).to_string(),
+           off_pv: false,
            state_hash: format!("{:032x}", zobrist_key(state)),
        };
        out.push(rec);
@@ -466,16 +495,13 @@ fn enumerate_solved_records(
        visited: &mut hashbrown::HashSet<u128>,
        cap: Option<u8>,
        out: &mut Vec<ExportRecord>,
-       policy_format: &PolicyFormatOpt,
-       value_mode: &ValueModeOpt,
-       mcts_rollouts: usize,
-       base_seed: u64,
+       export_cfg: &ExportConfig,
    ) {
        let key = zobrist_key(state);
        if !visited.insert(key) {
            return;
        }
-       push_record(state, cards, tt, cap, out, policy_format, value_mode, mcts_rollouts, base_seed);
+       push_record(state, cards, tt, cap, out, export_cfg);
 
        if state.is_terminal() {
            return;
@@ -483,12 +509,12 @@ fn enumerate_solved_records(
        let moves = legal_moves(state);
        for mv in moves {
            if let Ok(ns) = apply_move(state, cards, mv) {
-               dfs(&ns, cards, tt, visited, cap, out, policy_format, value_mode, mcts_rollouts, base_seed);
+               dfs(&ns, cards, tt, visited, cap, out, export_cfg);
            }
        }
    }
 
-   dfs(initial, cards, &mut tt, &mut visited, max_depth, &mut out, &policy_format, &value_mode, mcts_rollouts, base_seed);
+   dfs(initial, cards, &mut tt, &mut visited, max_depth, &mut out, export_cfg);
    out
 }
 
@@ -591,11 +617,184 @@ fn mcts_policy_distribution(
     dist
 }
 
+//
+// Helper: pick a uniform random legal move excluding the PV move if possible.
+// Falls back to PV move (or None) when no alternative exists.
+//
+fn pick_random_non_pv_move(
+    state: &GameState,
+    pv: Option<triplecargo::Move>,
+    seed: u64,
+    game_id: u64,
+    turn: u8,
+) -> Option<triplecargo::Move> {
+    // Candidate moves = all legals except PV (if provided)
+    let mut candidates = legal_moves(state);
+    if let Some(pv_mv) = pv {
+        candidates.retain(|m| !(m.card_id == pv_mv.card_id && m.cell == pv_mv.cell));
+    }
+
+    if candidates.is_empty() {
+        // No alternative to PV: return PV (or None in terminal)
+        return pv;
+    }
+
+    // Deterministic RNG derived from (seed, game_id, turn)
+    let mut rng = rng_for_state(seed, game_id, turn);
+    let idx = rng.gen_range(0..candidates.len());
+    Some(candidates[idx])
+}
+//
+// Helper: pick a weighted random legal move (softmax over child Q) excluding PV.
+// - child_vals: (Move, Q) for each legal root move
+// - pv: principal-variation move (excluded by setting prob=0)
+// - Sampling uses rng_for_state(seed, game_id, turn) for determinism
+//
+fn pick_weighted_non_pv_move(
+    child_vals: &[(triplecargo::Move, i8)],
+    pv: Option<triplecargo::Move>,
+    seed: u64,
+    game_id: u64,
+    turn: u8,
+) -> Option<triplecargo::Move> {
+    // Candidates: all children excluding the PV move (if provided)
+    let mut cands: Vec<(triplecargo::Move, i8)> = Vec::new();
+    match pv {
+        Some(pv_mv) => {
+            for &(m, q) in child_vals {
+                if !(m.card_id == pv_mv.card_id && m.cell == pv_mv.cell) {
+                    cands.push((m, q));
+                }
+            }
+        }
+        None => {
+            cands.extend_from_slice(child_vals);
+        }
+    }
+
+    if cands.is_empty() {
+        // No alternative candidate: return PV (or None)
+        return pv;
+    }
+
+    // Stable softmax over Q values (i8 -> f64)
+    let max_q = cands.iter().map(|(_, q)| *q as f64).fold(f64::NEG_INFINITY, f64::max);
+    let mut weights: Vec<f64> = Vec::with_capacity(cands.len());
+    let mut sum_w: f64 = 0.0;
+    for &(_, q) in &cands {
+        let w = (q as f64 - max_q).exp();
+        weights.push(w);
+        sum_w += w;
+    }
+
+    // Guard against degenerate sums; fallback to uniform
+    if !(sum_w.is_finite()) || sum_w <= 0.0 {
+        let mut rng = rng_for_state(seed, game_id, turn);
+        let idx = rng.gen_range(0..cands.len());
+        return Some(cands[idx].0);
+    }
+
+    // Sample proportionally using cumulative probabilities
+    let mut rng = rng_for_state(seed, game_id, turn);
+    let r: f64 = rng.gen::<f64>(); // in [0,1)
+    let mut acc: f64 = 0.0;
+    for (i, &(mv, _)) in cands.iter().enumerate() {
+        acc += weights[i] / sum_w;
+        if r < acc {
+            return Some(mv);
+        }
+    }
+
+    // Fallback due to potential rounding: return last candidate
+    Some(cands.last().unwrap().0)
+}
+//
+// Helper: parse "card-cell" key into a Move
+//
+fn parse_move_key(key: &str) -> Option<triplecargo::Move> {
+    let mut parts = key.splitn(2, '-');
+    let card_s = parts.next()?;
+    let cell_s = parts.next()?;
+    let card_id: u16 = card_s.parse().ok()?;
+    let cell_u: u8 = cell_s.parse().ok()?;
+    Some(triplecargo::Move { card_id, cell: cell_u })
+}
+
+//
+// Helper: pick a move from an MCTS root distribution excluding the PV move.
+// - If policy_format=mcts, reuse the provided root distribution (callers should pass it).
+// - Else compute root MCTS with --mcts-rollouts and a deterministic seed (callers provide a dist).
+// - Set PV probability to 0, renormalize, and sample with rng_for_state(seed, game_id, turn).
+// - Fallback: if PV had all mass (sum of others == 0), pick the highest-prob non-PV move deterministically
+//   (first by BTreeMap order in a tie). If no alternative exists, return PV.
+//
+fn pick_mcts_non_pv_move_from_dist(
+    dist: &BTreeMap<String, f32>,
+    pv: Option<triplecargo::Move>,
+    seed: u64,
+    game_id: u64,
+    turn: u8,
+) -> Option<triplecargo::Move> {
+    // Build candidates excluding PV
+    let mut cands: Vec<(triplecargo::Move, f32)> = Vec::new();
+    for (k, &p) in dist.iter() {
+        if let Some(mv) = parse_move_key(k) {
+            // Exclude PV by assigning zero probability
+            if let Some(pv_mv) = pv {
+                if mv.card_id == pv_mv.card_id && mv.cell == pv_mv.cell {
+                    continue;
+                }
+            }
+            cands.push((mv, p.max(0.0)));
+        }
+    }
+
+    if cands.is_empty() {
+        // No alternative candidate: return PV (or None)
+        return pv;
+    }
+
+    // Sum of non-PV probabilities
+    let sum_p: f64 = cands.iter().map(|(_, p)| *p as f64).sum();
+
+    if sum_p > 0.0 && sum_p.is_finite() {
+        // Sample proportionally using cumulative probabilities
+        let mut rng = rng_for_state(seed, game_id, turn);
+        let r: f64 = rng.gen::<f64>(); // [0,1)
+        let mut acc: f64 = 0.0;
+        for (mv, p) in &cands {
+            acc += (*p as f64) / sum_p;
+            if r < acc {
+                return Some(*mv);
+            }
+        }
+        // Fallback to last due to rounding
+        return Some(cands.last().unwrap().0);
+    }
+
+    // Fallback: all mass was on PV (sum of others == 0) → pick highest-prob non-PV deterministically.
+    // In a tie, BTreeMap iteration order induces a stable choice.
+    let mut best: Option<(triplecargo::Move, f32)> = None;
+    for &(mv, p) in &cands {
+        best = match best {
+            None => Some((mv, p)),
+            Some((bmv, bp)) => {
+                if p > bp {
+                    Some((mv, p))
+                } else {
+                    Some((bmv, bp))
+                }
+            }
+        };
+    }
+    Some(best.unwrap().0)
+}
+ 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
     // Configure a small, deterministic Rayon pool (2-4 threads). Ignore error if already set.
-    let _ = ThreadPoolBuilder::new().num_threads(4).build_global();
+    let _ = ThreadPoolBuilder::new().num_threads(6).build_global();
 
     let t0 = Instant::now();
 
@@ -627,8 +826,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ExportModeOpt::Trajectory => {
                 let games = args.games;
                 println!(
-                    "[export] Mode=trajectory games={} hand_strategy={:?} seed={:#x} policy_format={:?} value_mode={:?}",
-                    games, args.hand_strategy, args.seed, args.policy_format, args.value_mode
+                    "[export] Mode=trajectory games={} hand_strategy={:?} seed={:#x} policy_format={:?} value_mode={:?} off_pv_rate={} off_pv_strategy={:?}",
+                    games, args.hand_strategy, args.seed, args.policy_format, args.value_mode, args.off_pv_rate, args.off_pv_strategy
                 );
 
                 let mut total_lines: usize = 0;
@@ -665,12 +864,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let mut state = GameState::with_hands(rules, hand_a, hand_b, cell_elements);
                     let mut tt = InMemoryTT::default();
 
+                    // Decide per-game off-PV sampling (random or weighted strategies)
+                    let off_pv_game = matches!(args.off_pv_strategy, OffPvStrategyOpt::Random | OffPvStrategyOpt::Weighted | OffPvStrategyOpt::Mcts)
+                        && args.off_pv_rate > 0.0
+                        && {
+                            let mut grng = rng_for_state(args.seed, i as u64, 0);
+                            grng.gen::<f32>() < args.off_pv_rate
+                        };
+
                     // Play a single principal-variation trajectory of 9 plies
                     for _ply in 0..9 {
                         // In trajectory mode we always search full remaining depth to obtain final-outcome value targets.
                         let eff_depth = 9 - state.board.filled_count();
 
-                        let (val, bm, _nodes) = search_root(&state, &cards, eff_depth, &mut tt);
+                        let (val, bm, child_vals, _nodes) = search_root_with_children(&state, &cards, eff_depth, &mut tt);
 
                         // Serialize current state record
                         let mut board_vec: Vec<BoardCell> = Vec::with_capacity(9);
@@ -695,6 +902,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         for &o in state.hands_b.iter() { if let Some(id) = o { hands_b_vec.push(id); } }
                         let hands_rec = HandsRecord { a: hands_a_vec, b: hands_b_vec };
 
+                        // Optional root MCTS distribution cache for off-PV stepping reuse
+                        let mut mcts_root_dist: Option<BTreeMap<String, f32>> = None;
+
                         // Build policy output based on requested format
                         let policy_out: Option<PolicyOut> = match args.policy_format {
                             PolicyFormatOpt::Onehot => {
@@ -704,6 +914,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 // Seed per ply for determinism (trajectory keeps legacy per-ply seeding)
                                 let seed_for_rollouts = splitmix64(&mut rng_state);
                                 let dist = mcts_policy_distribution(&state, &cards, args.mcts_rollouts, seed_for_rollouts);
+                                mcts_root_dist = Some(dist.clone());
                                 Some(PolicyOut::Dist(dist))
                             }
                         };
@@ -722,6 +933,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             policy_target: policy_out,
                             value_target: vt,
                             value_mode: value_mode_str(&args.value_mode).to_string(),
+                            off_pv: off_pv_game,
                             state_hash: format!("{:032x}", zobrist_key(&state)),
                         };
                         let line = serde_json::to_string(&rec).map_err(|e| format!("serialize JSONL record error: {e}"))?;
@@ -729,8 +941,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         writer.write_all(b"\n").map_err(|e| format!("export write error: {e}"))?;
                         total_lines += 1;
 
-                        // Apply best move; if None (shouldn't happen before full), stop
-                        if let Some(mv) = bm {
+                        // Choose next move based on off-PV setting
+                        let next_mv = if off_pv_game {
+                            match args.off_pv_strategy {
+                                OffPvStrategyOpt::Random => {
+                                    pick_random_non_pv_move(&state, bm, args.seed, i as u64, state.board.filled_count())
+                                }
+                                OffPvStrategyOpt::Weighted => {
+                                    pick_weighted_non_pv_move(&child_vals, bm, args.seed, i as u64, state.board.filled_count())
+                                }
+                                OffPvStrategyOpt::Mcts => {
+                                    if matches!(args.policy_format, PolicyFormatOpt::Mcts) {
+                                        // Reuse root distribution from policy_out
+                                        let dist_ref = mcts_root_dist.as_ref().expect("mcts_root_dist should be present when policy_format=mcts");
+                                        pick_mcts_non_pv_move_from_dist(dist_ref, bm, args.seed, i as u64, state.board.filled_count())
+                                    } else {
+                                        // Compute root MCTS distribution just for stepping (deterministic per-ply seed)
+                                        let seed_for_mcts_step = splitmix64(&mut rng_state);
+                                        let dist2 = mcts_policy_distribution(&state, &cards, args.mcts_rollouts, seed_for_mcts_step);
+                                        pick_mcts_non_pv_move_from_dist(&dist2, bm, args.seed, i as u64, state.board.filled_count())
+                                    }
+                                }
+                            }
+                        } else {
+                            bm
+                        };
+                        if let Some(mv) = next_mv {
                             if let Ok(ns) = apply_move(&state, &cards, mv) {
                                 state = ns;
                             } else {
@@ -740,6 +976,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             break;
                         }
                     }
+
+                    println!("{}/{} games computed", i + 1, games);
 
                     // Periodic flush
                     if total_lines % 10_000 == 0 {
@@ -760,8 +998,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ExportModeOpt::Full => {
                 // One hand pair only; ignore --games
                 println!(
-                    "[export] Mode=full (ignoring --games). hand_strategy={:?} seed={:#x} policy_format={:?} value_mode={:?}",
-                    args.hand_strategy, args.seed, args.policy_format, args.value_mode
+                    "[export] Mode=full (ignoring --games). hand_strategy={:?} seed={:#x} policy_format={:?} value_mode={:?} off_pv_rate={} off_pv_strategy={:?}",
+                    args.hand_strategy, args.seed, args.policy_format, args.value_mode, args.off_pv_rate, args.off_pv_strategy
                 );
 
                 let mut rng_state: u64 = args.seed;
@@ -790,15 +1028,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 let initial = GameState::with_hands(rules, hand_a, hand_b, cell_elements);
 
+                // Build export configuration (plumbed through; no behavior change yet for off-PV fields)
+                let export_cfg = ExportConfig {
+                    policy_format: args.policy_format.clone(),
+                    value_mode: args.value_mode.clone(),
+                    mcts_rollouts: args.mcts_rollouts,
+                    off_pv_rate: args.off_pv_rate,
+                    off_pv_strategy: args.off_pv_strategy.clone(),
+                    base_seed: args.seed, // base seed for per-state MCTS seeding
+                };
+
                 // Full enumeration with new schema/options
                 let records = enumerate_solved_records(
                     &initial,
                     &cards,
                     args.max_depth,
-                    args.policy_format.clone(),
-                    args.value_mode.clone(),
-                    args.mcts_rollouts,
-                    args.seed, // base seed for per-state MCTS seeding
+                    &export_cfg,
                 );
 
                 let mut total_lines: usize = 0;
@@ -955,4 +1200,401 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     Ok(())
+}
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn cli_defaults_when_omitted() {
+        // Use --export to satisfy required_unless_present without needing --hands
+        let args = Args::try_parse_from(["precompute", "--export", "x.jsonl"])
+            .expect("Args parse failed");
+        assert!((args.off_pv_rate - 0.0).abs() < f32::EPSILON, "default off_pv_rate should be 0.0");
+        assert!(matches!(args.off_pv_strategy, OffPvStrategyOpt::Weighted), "default off_pv_strategy should be Weighted");
+    }
+
+    #[test]
+    fn cli_accepts_offpv_flags() {
+        let args = Args::try_parse_from([
+            "precompute",
+            "--export",
+            "x.jsonl",
+            "--off-pv-rate",
+            "0.25",
+            "--off-pv-strategy",
+            "random",
+        ])
+        .expect("Args parse with off-PV flags failed");
+
+        assert!((args.off_pv_rate - 0.25).abs() < 1e-6, "off_pv_rate parsed incorrectly");
+        assert!(matches!(args.off_pv_strategy, OffPvStrategyOpt::Random), "off_pv_strategy should parse as Random");
+    }
+
+    #[test]
+    fn help_includes_offpv_flags() {
+        let mut buf: Vec<u8> = Vec::new();
+        Args::command().write_help(&mut buf).expect("write_help failed");
+        let help = String::from_utf8(buf).expect("utf8 help");
+        assert!(help.contains("--off-pv-rate"), "help text missing --off-pv-rate");
+        assert!(help.contains("--off-pv-strategy"), "help text missing --off-pv-strategy");
+    }
+
+    #[test]
+    fn export_records_include_off_pv_false() {
+        // Build a near-terminal state (8 plies) to keep enumeration small.
+        let cards = load_cards_from_json("data/cards.json").expect("cards load");
+        let rules = Rules::default();
+        let mut state = GameState::with_hands(rules, [1, 2, 3, 4, 5], [6, 7, 8, 9, 10], None);
+
+        // Play 8 deterministic plies (first legal each time)
+        for _ in 0..8 {
+            let mv = legal_moves(&state).into_iter().next().expect("legal move");
+            state = apply_move(&state, &cards, mv).expect("apply_move");
+        }
+
+        // Minimal export configuration; off-PV is not used in full export (always false).
+        let export_cfg = ExportConfig {
+            policy_format: PolicyFormatOpt::Onehot,
+            value_mode: ValueModeOpt::Winloss,
+            mcts_rollouts: 0,
+            off_pv_rate: 0.0,
+            off_pv_strategy: OffPvStrategyOpt::Weighted,
+            base_seed: 42,
+        };
+
+        // Enumerate solved records from this state and assert off_pv is present and always false.
+        let recs = enumerate_solved_records(&state, &cards, None, &export_cfg);
+        assert!(!recs.is_empty(), "expected at least one exported record");
+        for r in &recs {
+            assert_eq!(r.off_pv, false, "off_pv must be false in full export");
+            let js = serde_json::to_string(r).expect("serialize record");
+            assert!(
+                js.contains("\"off_pv\":false"),
+                "serialized JSON must include off_pv=false; got: {}",
+                js
+            );
+        }
+    }
+
+    // --- Off-PV stepping tests (random strategy) ---
+
+    fn build_initial_state_for_tests() -> (triplecargo::CardsDb, GameState) {
+        let cards = load_cards_from_json("data/cards.json").expect("cards load");
+        let rules = Rules::default();
+        let state = GameState::with_hands(rules, [1, 2, 3, 4, 5], [6, 7, 8, 9, 10], None);
+        (cards, state)
+    }
+
+    #[test]
+    fn offpv_random_never_chooses_pv_when_alternative_exists() {
+        let (cards, mut state) = build_initial_state_for_tests();
+        let seed: u64 = 12345;
+        let game_id: u64 = 0;
+        let mut tt = InMemoryTT::default();
+
+        for _ply in 0..9 {
+            let eff_depth = 9 - state.board.filled_count();
+            let (_val, bm, _nodes) = search_root(&state, &cards, eff_depth, &mut tt);
+
+            // Determine next move as off-PV random
+            let next_mv = pick_random_non_pv_move(&state, bm, seed, game_id, state.board.filled_count());
+
+            // If there are multiple legals and PV exists, ensure we did not choose PV
+            let legals = legal_moves(&state);
+            if legals.len() > 1 {
+                if let (Some(pv), Some(ch)) = (bm, next_mv) {
+                    assert!(
+                        !(pv.card_id == ch.card_id && pv.cell == ch.cell),
+                        "off-PV random should not choose PV when an alternative exists"
+                    );
+                }
+            }
+
+            if let Some(mv) = next_mv {
+                state = apply_move(&state, &cards, mv).expect("apply move");
+            } else {
+                break;
+            }
+        }
+    }
+
+    #[test]
+    fn offpv_rate_zero_matches_pv_baseline() {
+        let (cards, mut state_baseline) = build_initial_state_for_tests();
+        let (cards2, mut state_test) = build_initial_state_for_tests();
+        let mut tt1 = InMemoryTT::default();
+        let mut tt2 = InMemoryTT::default();
+
+        let mut baseline_seq: Vec<triplecargo::Move> = Vec::new();
+        let mut test_seq: Vec<triplecargo::Move> = Vec::new();
+
+        // Baseline: always follow PV
+        for _ply in 0..9 {
+            let eff_depth = 9 - state_baseline.board.filled_count();
+            let (_val, bm, _nodes) = search_root(&state_baseline, &cards, eff_depth, &mut tt1);
+            if let Some(mv) = bm {
+                baseline_seq.push(mv);
+                state_baseline = apply_move(&state_baseline, &cards, mv).expect("apply move");
+            } else {
+                break;
+            }
+        }
+
+        // "Rate zero" behavior: our stepping should also follow PV
+        for _ply in 0..9 {
+            let eff_depth = 9 - state_test.board.filled_count();
+            let (_val, bm, _nodes) = search_root(&state_test, &cards2, eff_depth, &mut tt2);
+            let mv = bm;
+            if let Some(m) = mv {
+                test_seq.push(m);
+                state_test = apply_move(&state_test, &cards2, m).expect("apply move");
+            } else {
+                break;
+            }
+        }
+
+        assert_eq!(baseline_seq.len(), test_seq.len(), "sequence lengths differ");
+        for (a, b) in baseline_seq.iter().zip(test_seq.iter()) {
+            assert!(a.card_id == b.card_id && a.cell == b.cell, "moves differ: baseline {:?} vs test {:?}", a, b);
+        }
+    }
+
+    #[test]
+    fn offpv_determinism_fixed_seed_identical_sequences() {
+        let (cards_a, mut state_a) = build_initial_state_for_tests();
+        let (cards_b, mut state_b) = build_initial_state_for_tests();
+        let seed: u64 = 0xC0FFEE;
+        let game_id: u64 = 7;
+        let mut tt_a = InMemoryTT::default();
+        let mut tt_b = InMemoryTT::default();
+
+        let mut seq_a: Vec<triplecargo::Move> = Vec::new();
+        let mut seq_b: Vec<triplecargo::Move> = Vec::new();
+
+        for _ply in 0..9 {
+            let eff_a = 9 - state_a.board.filled_count();
+            let (_va, bma, _na) = search_root(&state_a, &cards_a, eff_a, &mut tt_a);
+            let mv_a = pick_random_non_pv_move(&state_a, bma, seed, game_id, state_a.board.filled_count());
+            if let Some(m) = mv_a {
+                seq_a.push(m);
+                state_a = apply_move(&state_a, &cards_a, m).expect("apply move");
+            } else { break; }
+
+            let eff_b = 9 - state_b.board.filled_count();
+            let (_vb, bmb, _nb) = search_root(&state_b, &cards_b, eff_b, &mut tt_b);
+            let mv_b = pick_random_non_pv_move(&state_b, bmb, seed, game_id, state_b.board.filled_count());
+            if let Some(m) = mv_b {
+                seq_b.push(m);
+                state_b = apply_move(&state_b, &cards_b, m).expect("apply move");
+            } else { break; }
+        }
+
+        assert_eq!(seq_a.len(), seq_b.len(), "determinism: lengths differ");
+        for (a, b) in seq_a.iter().zip(seq_b.iter()) {
+            assert!(a.card_id == b.card_id && a.cell == b.cell, "determinism: moves differ {:?} vs {:?}", a, b);
+        }
+    }
+
+    #[test]
+    fn offpv_line_count_invariant_nine() {
+        let (_cards, mut state) = build_initial_state_for_tests();
+        let seed: u64 = 999;
+        let game_id: u64 = 0;
+        let cards = load_cards_from_json("data/cards.json").expect("cards load");
+        let mut tt = InMemoryTT::default();
+        let mut steps = 0usize;
+
+        for _ply in 0..9 {
+            let eff = 9 - state.board.filled_count();
+            let (_v, bm, _n) = search_root(&state, &cards, eff, &mut tt);
+            let mv = pick_random_non_pv_move(&state, bm, seed, game_id, state.board.filled_count());
+            if let Some(m) = mv {
+                steps += 1;
+                state = apply_move(&state, &cards, m).expect("apply move");
+            } else { break; }
+        }
+        assert_eq!(steps, 9, "trajectory should have exactly 9 plies");
+    }
+
+    // --- Off-PV stepping tests (weighted strategy) ---
+    #[test]
+    fn offpv_weighted_never_chooses_pv_when_alternative_exists() {
+        // Synthetic root children with PV present among children
+        let mv_pv = triplecargo::Move { card_id: 10, cell: 0 };
+        let mv_a = triplecargo::Move { card_id: 11, cell: 1 };
+        let mv_b = triplecargo::Move { card_id: 12, cell: 2 };
+        let child_vals = vec![(mv_pv, 0i8), (mv_a, 1i8), (mv_b, -1i8)];
+
+        let seed: u64 = 0x55AA55AA;
+        let turn: u8 = 0;
+
+        // Sample across multiple game_ids; PV must never be selected when an alternative exists
+        for gid in 0u64..200u64 {
+            let pick = pick_weighted_non_pv_move(&child_vals, Some(mv_pv), seed, gid, turn)
+                .expect("expected a move");
+            assert!(
+                !(pick.card_id == mv_pv.card_id && pick.cell == mv_pv.cell),
+                "weighted picker must not choose PV when alternatives exist"
+            );
+        }
+    }
+
+    #[test]
+    fn offpv_weighted_determinism_fixed_seed_identical_sequences() {
+        // Fixed synthetic child set
+        let mv_pv = triplecargo::Move { card_id: 20, cell: 0 };
+        let mv_a = triplecargo::Move { card_id: 21, cell: 1 };
+        let mv_b = triplecargo::Move { card_id: 22, cell: 2 };
+        // Ensure both non-PV are eligible and have different Qs
+        let child_vals = vec![(mv_pv, 0i8), (mv_a, 3i8), (mv_b, -2i8)];
+
+        let seed: u64 = 0xC0FFEE;
+        let game_id: u64 = 7;
+
+        // Produce two sequences over turns 0..8 with identical parameters
+        let mut seq1: Vec<triplecargo::Move> = Vec::new();
+        let mut seq2: Vec<triplecargo::Move> = Vec::new();
+
+        for t in 0u8..9u8 {
+            let a = pick_weighted_non_pv_move(&child_vals, Some(mv_pv), seed, game_id, t)
+                .expect("seq1 move");
+            let b = pick_weighted_non_pv_move(&child_vals, Some(mv_pv), seed, game_id, t)
+                .expect("seq2 move");
+            seq1.push(a);
+            seq2.push(b);
+        }
+
+        assert_eq!(seq1.len(), seq2.len(), "determinism: lengths differ");
+        for (a, b) in seq1.iter().zip(seq2.iter()) {
+            assert!(a.card_id == b.card_id && a.cell == b.cell, "determinism: moves differ {:?} vs {:?}", a, b);
+        }
+    }
+
+    #[test]
+    fn offpv_weighted_samples_dominant_child_more_often() {
+        // Create a child set where one NON-PV child is clearly dominant by Q
+        let mv_pv = triplecargo::Move { card_id: 30, cell: 0 }; // set PV to a non-dominant move
+        let mv_dom = triplecargo::Move { card_id: 31, cell: 1 }; // dominant candidate
+        let mv_other = triplecargo::Move { card_id: 32, cell: 2 };
+
+        // Assign Q values: dominant >> other; PV excluded by the picker
+        let child_vals = vec![(mv_pv, 0i8), (mv_dom, 5i8), (mv_other, 0i8)];
+
+        let seed: u64 = 0xDEADBEEF;
+        let turn: u8 = 0;
+
+        let mut count_dom = 0usize;
+        let mut count_other = 0usize;
+
+        // Vary game_id to generate many independent draws with the same RNG scheme
+        let trials = 2000usize;
+        for gid in 0..trials {
+            let pick = pick_weighted_non_pv_move(&child_vals, Some(mv_pv), seed, gid as u64, turn)
+                .expect("expected a move");
+            if pick.card_id == mv_dom.card_id && pick.cell == mv_dom.cell {
+                count_dom += 1;
+            } else if pick.card_id == mv_other.card_id && pick.cell == mv_other.cell {
+                count_other += 1;
+            } else {
+                panic!("picked unexpected move: {:?}", pick);
+            }
+        }
+
+        // Dominant child must be sampled strictly more often than the other non-PV child
+        assert!(
+            count_dom > count_other,
+            "dominant child should be sampled more often; dom={} other={}",
+            count_dom,
+            count_other
+        );
+    }
+}
+// --- Off-PV stepping tests (mcts strategy) ---
+#[cfg(test)]
+mod mcts_offpv_tests {
+    use super::*;
+
+    #[test]
+    fn offpv_mcts_excludes_pv_when_alternative_exists() {
+        // Build a synthetic MCTS root distribution with PV and two alternatives
+        let mv_pv = triplecargo::Move { card_id: 101, cell: 0 };
+        let mv_a = triplecargo::Move { card_id: 102, cell: 1 };
+        let mv_b = triplecargo::Move { card_id: 103, cell: 2 };
+
+        let mut dist: BTreeMap<String, f32> = BTreeMap::new();
+        dist.insert(format!("{}-{}", mv_pv.card_id, mv_pv.cell), 0.4);
+        dist.insert(format!("{}-{}", mv_a.card_id, mv_a.cell), 0.35);
+        dist.insert(format!("{}-{}", mv_b.card_id, mv_b.cell), 0.25);
+
+        let seed: u64 = 0xABCDEF12;
+        let turn: u8 = 0;
+
+        // Across many draws with different game_id, PV should never be picked
+        for gid in 0u64..500u64 {
+            let pick = super::pick_mcts_non_pv_move_from_dist(&dist, Some(mv_pv), seed, gid, turn)
+                .expect("expected a move");
+            assert!(
+                !(pick.card_id == mv_pv.card_id && pick.cell == mv_pv.cell),
+                "mcts picker must not choose PV when alternatives exist"
+            );
+        }
+    }
+
+    #[test]
+    fn offpv_mcts_determinism_fixed_seed_identical_sequences() {
+        let mv_pv = triplecargo::Move { card_id: 201, cell: 0 };
+        let mv_a = triplecargo::Move { card_id: 202, cell: 1 };
+        let mv_b = triplecargo::Move { card_id: 203, cell: 2 };
+
+        let mut dist: BTreeMap<String, f32> = BTreeMap::new();
+        dist.insert(format!("{}-{}", mv_pv.card_id, mv_pv.cell), 0.2);
+        dist.insert(format!("{}-{}", mv_a.card_id, mv_a.cell), 0.5);
+        dist.insert(format!("{}-{}", mv_b.card_id, mv_b.cell), 0.3);
+
+        let seed: u64 = 0xC0FFEE77;
+        let game_id: u64 = 9;
+
+        // Build two sequences over turns; must be identical with same RNG inputs
+        let mut seq1: Vec<triplecargo::Move> = Vec::new();
+        let mut seq2: Vec<triplecargo::Move> = Vec::new();
+
+        for t in 0u8..9u8 {
+            let a = super::pick_mcts_non_pv_move_from_dist(&dist, Some(mv_pv), seed, game_id, t).expect("seq1");
+            let b = super::pick_mcts_non_pv_move_from_dist(&dist, Some(mv_pv), seed, game_id, t).expect("seq2");
+            seq1.push(a);
+            seq2.push(b);
+        }
+
+        assert_eq!(seq1.len(), seq2.len(), "determinism: lengths differ");
+        for (a, b) in seq1.iter().zip(seq2.iter()) {
+            assert!(a.card_id == b.card_id && a.cell == b.cell, "determinism: moves differ {:?} vs {:?}", a, b);
+        }
+    }
+
+    #[test]
+    fn offpv_mcts_fallback_non_pv_when_pv_had_all_mass() {
+        // Construct a distribution where PV has all the mass, others exist with 0.0
+        let mv_pv = triplecargo::Move { card_id: 301, cell: 0 };
+        let mv_a = triplecargo::Move { card_id: 302, cell: 1 };
+        let mv_b = triplecargo::Move { card_id: 303, cell: 2 };
+
+        let mut dist: BTreeMap<String, f32> = BTreeMap::new();
+        dist.insert(format!("{}-{}", mv_pv.card_id, mv_pv.cell), 1.0);
+        dist.insert(format!("{}-{}", mv_a.card_id, mv_a.cell), 0.0);
+        dist.insert(format!("{}-{}", mv_b.card_id, mv_b.cell), 0.0);
+
+        let seed: u64 = 0xDEADFACE;
+        let turn: u8 = 0;
+        let gid: u64 = 0;
+
+        // With PV removed, fallback should select a non-PV move deterministically
+        let pick = super::pick_mcts_non_pv_move_from_dist(&dist, Some(mv_pv), seed, gid, turn)
+            .expect("expected a move");
+        assert!(
+            !(pick.card_id == mv_pv.card_id && pick.cell == mv_pv.cell),
+            "fallback should select a non-PV move when PV had all mass"
+        );
+    }
 }
