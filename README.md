@@ -1,8 +1,6 @@
 ♠️ Triplecargo — Triple Triad Assistant & Solver (FF8)
 
-
 Deterministic, high‑performance Rust implementation of the Final Fantasy VIII Triple Triad ruleset, designed to support:
-
 
 - Perfect play solving (Negamax + αβ + TT).
 - Full state‑space precomputation for instant queries.
@@ -10,9 +8,7 @@ Deterministic, high‑performance Rust implementation of the Final Fantasy VIII 
 - AI/ML integration for lightweight move suggestion and imperfect‑information play.
 Triplecargo is both a research‑grade solver and the foundation for a superhuman Triple Triad assistant — combining exact computation with modern AI techniques.
 
-
 ---
-
 ✨ Features
 
 - Full ruleset: Basic, Elemental, Same, Plus, Same Wall, Combo cascades.
@@ -25,7 +21,6 @@ Triplecargo is both a research‑grade solver and the foundation for a superhuma
 - Training data export (JSONL): trajectory or full state‑space, policy_format onehot|mcts, deterministic with fixed seed.
 
 ---
-
 📂 Project layout
 
 - Core engine: rules, state, hashing, scoring.
@@ -38,7 +33,6 @@ Triplecargo is both a research‑grade solver and the foundation for a superhuma
 - Tests: engine correctness, rule edge cases, solver determinism.
 
 ---
-
 🧮 Data model
 
 - Cards: loaded from data/cards.json, validated for ranges and uniqueness.
@@ -48,7 +42,6 @@ Triplecargo is both a research‑grade solver and the foundation for a superhuma
 - Hashing: XOR‑based Zobrist, incremental updates, 128‑bit keys.
 
 ---
- 
 📤 Training data export (JSONL)
 
 Overview
@@ -79,7 +72,22 @@ Core flags
     - weighted: softmax over root child negamax Q values; PV mass set to 0, renormalised, then sampled.
     - mcts: reuse root MCTS distribution when policy_format=mcts; otherwise compute root MCTS with --mcts-rollouts and sample after zeroing PV.
 
-Determinism specifics
+Parallel export (worker + writer) — TASK T7
+- The export pipeline now supports an explicit worker + writer model (replacing the previous Rayon pool).
+- New CLI flag: --threads N (default: available_parallelism()-1). Workers claim game indices via an atomic counter and operate deterministically.
+- Worker behavior:
+  - Deterministically sample hands/elements from the master seed and game id.
+  - For each game produce 9 JSONL lines by running full-depth solver searches (using search_root_with_children() for policy Q values).
+  - Send (game_id, Vec<String>) to the single writer thread.
+- Writer behavior:
+  - Single dedicated writer receives per-game line blocks, buffers out-of-order arrivals, and writes games in strict increasing game_id order to maintain byte-for-byte determinism across different thread counts.
+- Determinism guarantees:
+  - With identical seed + flags the JSONL output is byte-for-byte identical whether --threads=1 or --threads>1.
+  - Tests: --games 10 produces 90 lines; output compared equal across thread counts.
+- Progress:
+  - The trajectory export includes an indicatif ProgressBar with a background updater that reports states/sec, nodes/sec, ETA, and policy info.
+
+Determinisim specifics
 - Trajectory mode:
   - Labels (policy/value) are computed from full-depth perfect play at each ply; labels remain PV-optimal regardless of stepping strategy.
   - Off-PV stepping uses a per-ply RNG derived from (seed, game_id, turn) for deterministic sampling.
@@ -205,7 +213,6 @@ Metadata
 - Combo: cascades apply Basic rule only.
 
 ---
-
 ⚡ Performance & determinism
 
 - Move ordering: Corners > Edges > Center, then cell index, then card id.
@@ -215,7 +222,6 @@ Metadata
 - Determinism: same state → same result, reproducible DBs.
 
 ---
-
 🔮 Roadmap
 
 Near‑term
@@ -250,7 +256,6 @@ Long‑term
 	- Quantitative impact of Elemental RNG.
 
 ---
-
 🧪 Testing scope
 
 - Engine tests: rule correctness, determinism, allocation‑free hot paths.
@@ -259,16 +264,13 @@ Long‑term
 - Persistence tests: batch flush, compression, checkpoint/resume determinism.
 
 ---
-
 📜 License
 
 
 The code in this repository is provided under an open license (TBD).
 Triple Triad belongs to Square Enix (Final Fantasy VIII). This is a clean‑room reimplementation for research and educational purposes.
 
-
 ---
-
 🙏 Acknowledgements
 
 - FF8’s Triple Triad ruleset by Square Enix.

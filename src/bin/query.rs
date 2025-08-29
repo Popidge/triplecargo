@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use clap::{Parser, ValueEnum};
 use triplecargo::{
-    load_cards_from_json, zobrist_key, Element, GameState, Owner, Rules,
+    load_cards_from_json, zobrist_key, Element, GameState, Rules,
     persist::{load_db, ElementsMode},
 };
 

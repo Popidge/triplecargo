@@ -3,7 +3,7 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 use std::sync::{mpsc, Arc};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering, AtomicU64};
 use std::time::Instant;
 
 use clap::{Parser, ValueEnum};
@@ -556,12 +556,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let all_ids_sorted = all_card_ids_sorted(&cards);
     let bands_master = build_level_bands(&cards);
 
-    // Progress
-    let mut _nodes_total: u64 = 0;
-    let start_instant = Instant::now();
-    let mut last_tick = Instant::now();
-    let mut games_done: usize = 0;
-    let mut offpv_games_done: usize = 0;
+    // Progress counters (shared)
+    let nodes_total = Arc::new(AtomicU64::new(0));
+    let written_states = Arc::new(AtomicU64::new(0));
     let policy_info: String = match args.policy_format {
         PolicyFormatOpt::Mcts => format!("mcts@{}", args.mcts_rollouts),
         PolicyFormatOpt::Onehot => "onehot".to_string(),
@@ -577,6 +574,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .unwrap()
                     .progress_chars("=>-"),
             );
+            // Progress updater thread: updates PB message with floating rates and ETA every second.
+            let pb_updater = pb.clone();
+            let nodes_upd = Arc::clone(&nodes_total);
+            let written_upd = Arc::clone(&written_states);
+            let total_states_upd = total_states;
+            let policy_info_upd = policy_info.clone();
+            let start_instant = Instant::now();
+            std::thread::spawn(move || {
+                loop {
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                    let elapsed = start_instant.elapsed().as_secs_f64().max(1e-6);
+                    let states_done_u = written_upd.load(Ordering::Relaxed);
+                    let states_done = states_done_u as f64;
+                    let states_per_sec = states_done / elapsed;
+                    let nodes = nodes_upd.load(Ordering::Relaxed) as f64;
+                    let nodes_per_sec = nodes / elapsed;
+                    let nodes_m = nodes / 1.0e6;
+                    let remaining = (total_states_upd.saturating_sub(states_done_u)) as f64;
+                    let eta_secs = if states_per_sec > 1e-9 { (remaining / states_per_sec).round() as u64 } else { 0u64 };
+                    let msg = format!(
+                        "states/s {:.1} | nodes {:.2}M | ETA {} | pol {}",
+                        states_per_sec,
+                        nodes_m,
+                        format_hms(eta_secs),
+                        policy_info_upd,
+                    );
+                    pb_updater.set_position(states_done_u);
+                    pb_updater.set_message(msg);
+                }
+            });
 
             println!(
                 "[export] Mode=trajectory games={} hand_strategy={:?} seed={:#x} policy_format={:?} value_mode={:?} off_pv_rate={} off_pv_strategy={:?}",
@@ -607,12 +634,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             // Move writer + receiver to writer thread to ensure single-writer semantics
             let pb_clone = pb.clone();
+            let nodes_total_c = Arc::clone(&nodes_total);
+            let written_states_c = Arc::clone(&written_states);
             let writer_handle = std::thread::spawn(move || {
                 let mut writer = writer;
                 let mut pending: BTreeMap<usize, Vec<String>> = BTreeMap::new();
                 let mut next_write: usize = 0;
-
+ 
                 while let Ok((gid, lines)) = res_rx.recv() {
+                    // Track incoming work size for progress rates
+                    let batch_len: u64 = lines.len() as u64;
+                    nodes_total_c.fetch_add(0, Ordering::Relaxed); // placeholder if needed
+                    written_states_c.fetch_add(batch_len, Ordering::Relaxed);
+ 
                     pending.insert(gid, lines);
                     // Flush contiguous games
                     while let Some(lines) = pending.remove(&next_write) {
@@ -642,6 +676,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let bands_c = Arc::clone(&bands_arc);
                 let all_ids_c = Arc::clone(&all_ids_arc);
                 let job_counter = Arc::clone(&job_counter);
+                let nodes_total_c = Arc::clone(&nodes_total);
 
                 let hand_strategy = args.hand_strategy.clone();
                 let elements_opt = args.elements.clone();
@@ -700,10 +735,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                         let mut lines: Vec<String> = Vec::with_capacity(9);
 
+                        let mut nodes_sum_local: u64 = 0;
                         for _ply in 0..9 {
                             let eff_depth = 9 - state.board.filled_count();
                             // Always search full remaining depth (trajectory semantics)
-                            let (val, bm, child_vals, _nodes) = search_root_with_children(&state, &cards_c, eff_depth, &mut tt);
+                            let (val, bm, child_vals, nodes) = search_root_with_children(&state, &cards_c, eff_depth, &mut tt);
+                            nodes_sum_local = nodes_sum_local.saturating_add(nodes);
 
                             // Board vector
                             let mut board_vec: Vec<BoardCell> = Vec::with_capacity(9);
@@ -802,6 +839,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             // Throttled progress update message (in main would need shared state; skip here in worker)
                         } // ply loop
 
+                        let _ = nodes_total_c.fetch_add(nodes_sum_local, Ordering::Relaxed);
                         let _ = res_tx.send((i, lines));
                     } // worker loop
                 });
