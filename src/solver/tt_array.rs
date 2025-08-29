@@ -1,4 +1,5 @@
 use super::tt::{TranspositionTable, TTEntry};
+use std::mem::size_of;
 
 /// Fixed-size direct-mapped transposition table.
 /// - Capacity must be a power of two
@@ -99,5 +100,41 @@ impl TranspositionTable for FixedTT {
     #[inline]
     fn len(&self) -> usize {
         self.count
+    }
+}
+
+impl FixedTT {
+    /// Approximate bytes per entry = size_of(u128 key) + size_of(TTEntry)
+    #[inline]
+    pub fn bytes_per_entry() -> usize {
+        size_of::<u128>() + size_of::<TTEntry>()
+    }
+
+    /// Compute the largest power-of-two capacity that fits under the provided budget (in bytes).
+    /// Returns at least 1.
+    #[inline]
+    pub fn capacity_for_budget_bytes(budget_bytes: usize) -> usize {
+        let bpe = Self::bytes_per_entry();
+        if bpe == 0 || budget_bytes < bpe {
+            return 1;
+        }
+        let max_entries = budget_bytes / bpe;
+        // round down to the nearest power of two
+        let cap = max_entries.next_power_of_two() >> 1;
+        cap.max(1)
+    }
+
+    /// Approximate total bytes for a given capacity.
+    #[inline]
+    pub fn approx_bytes_for_capacity(capacity: usize) -> usize {
+        capacity.saturating_mul(Self::bytes_per_entry())
+    }
+
+    /// Convenience: construct a table using a MiB budget (rounded down to a power-of-two capacity).
+    #[inline]
+    pub fn with_budget_mib(mib: usize) -> Self {
+        let budget = mib.saturating_mul(1024 * 1024);
+        let cap = Self::capacity_for_budget_bytes(budget);
+        Self::with_capacity_pow2(cap)
     }
 }

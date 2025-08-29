@@ -14,8 +14,9 @@ use serde_json;
 
 use triplecargo::{
     load_cards_from_json, zobrist_key, Element, GameState, Owner, Rules, apply_move, legal_moves, score, rng_for_state,
-    solver::{InMemoryTT, search_root, search_root_with_children},
+    solver::{search_root, search_root_with_children},
 };
+use triplecargo::solver::tt_array::FixedTT;
 
 #[derive(Debug, Clone, ValueEnum)]
 enum ElementsOpt {
@@ -123,6 +124,10 @@ struct Args {
         visible_aliases = ["value_mode", "valuemode", "vm"]
     )]
     value_mode: ValueModeOpt,
+
+    /// Transposition table size per worker in MiB (rounded down to a power-of-two capacity under the budget)
+    #[arg(long = "tt-bytes", default_value_t = 32, value_name = "MiB")]
+    tt_bytes: usize,
 }
 
 fn parse_rules(s: &str) -> Rules {
@@ -593,6 +598,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let nodes_m = nodes / 1.0e6;
                     let remaining = (total_states_upd.saturating_sub(states_done_u)) as f64;
                     let eta_secs = if states_per_sec > 1e-9 { (remaining / states_per_sec).round() as u64 } else { 0u64 };
+                    let _nodes_per_sec = nodes / elapsed;
                     let msg = format!(
                         "states/s {:.1} | nodes {:.2}M | ETA {} | pol {}",
                         states_per_sec,
@@ -670,7 +676,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             // Spawn workers
             let mut worker_handles = Vec::with_capacity(worker_count);
-            for _ in 0..worker_count {
+            for worker_id in 0..worker_count {
                 let res_tx = res_tx.clone();
                 let cards_c = Arc::clone(&cards_arc);
                 let bands_c = Arc::clone(&bands_arc);
@@ -687,8 +693,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let value_mode = args.value_mode.clone();
                 let base_seed = args.seed;
                 let max_games = games;
+                let tt_mib = args.tt_bytes;
 
                 let handle = std::thread::spawn(move || {
+                    // Allocate a per-worker FixedTT and keep it warm across all games
+                    let budget_bytes = tt_mib.saturating_mul(1024 * 1024);
+                    let cap = FixedTT::capacity_for_budget_bytes(budget_bytes);
+                    let approx = FixedTT::approx_bytes_for_capacity(cap);
+                    eprintln!(
+                        "[worker {}] TT target={} MiB capacity={} entries ≈{:.1} MiB",
+                        worker_id,
+                        tt_mib,
+                        cap,
+                        (approx as f64) / (1024.0 * 1024.0)
+                    );
+                    let mut tt = FixedTT::with_capacity_pow2(cap);
+
                     loop {
                         let i = job_counter.fetch_add(1, Ordering::SeqCst);
                         if i >= max_games {
@@ -723,7 +743,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         };
 
                         let mut state = GameState::with_hands(rules, hand_a, hand_b, cell_elements);
-                        let mut tt = InMemoryTT::default();
 
                         // Per-game off-PV activation
                         let off_pv_game = matches!(off_pv_strategy, OffPvStrategyOpt::Random | OffPvStrategyOpt::Weighted | OffPvStrategyOpt::Mcts)
@@ -901,7 +920,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Enumerate via DFS, computing labels with search_root
             let mut out: Vec<ExportRecord> = Vec::new();
             let mut visited: hashbrown::HashSet<u128> = hashbrown::HashSet::default();
-            let mut tt = InMemoryTT::default();
+            // Single FixedTT sized by --tt-bytes for the entire full export
+            let budget_bytes = args.tt_bytes.saturating_mul(1024 * 1024);
+            let cap = FixedTT::capacity_for_budget_bytes(budget_bytes);
+            let approx = FixedTT::approx_bytes_for_capacity(cap);
+            eprintln!(
+                "[full] TT target={} MiB capacity={} entries ≈{:.1} MiB",
+                args.tt_bytes,
+                cap,
+                (approx as f64) / (1024.0 * 1024.0)
+            );
+            let mut tt = FixedTT::with_capacity_pow2(cap);
             let cards_ref = &cards;
 
             fn eff_depth_for(state: &GameState, cap: Option<u8>) -> u8 {
@@ -915,7 +944,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             fn push_record_full(
                 state: &GameState,
                 cards: &triplecargo::CardsDb,
-                tt: &mut InMemoryTT,
+                tt: &mut dyn triplecargo::solver::TranspositionTable,
                 cap: Option<u8>,
                 out: &mut Vec<ExportRecord>,
                 export_cfg: &ExportConfig,
@@ -978,7 +1007,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             fn dfs(
                 state: &GameState,
                 cards: &triplecargo::CardsDb,
-                tt: &mut InMemoryTT,
+                tt: &mut dyn triplecargo::solver::TranspositionTable,
                 visited: &mut hashbrown::HashSet<u128>,
                 cap: Option<u8>,
                 out: &mut Vec<ExportRecord>,

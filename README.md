@@ -72,6 +72,8 @@ Core flags
     - weighted: softmax over root child negamax Q values; PV mass set to 0, renormalised, then sampled.
     - mcts: reuse root MCTS distribution when policy_format=mcts; otherwise compute root MCTS with --mcts-rollouts and sample after zeroing PV.
 
+- Transposition table (per worker)
+  - --tt-bytes N               TT size per worker in MiB (default 32). Capacity is rounded down to the nearest power-of-two entries that fit under the requested budget. Applies to both trajectory and full export modes. Total memory usage ≈ workers × tt-bytes.
 Parallel export (worker + writer) — TASK T7
 - The export pipeline now supports an explicit worker + writer model (replacing the previous Rayon pool).
 - New CLI flag: --threads N (default: available_parallelism()-1). Workers claim game indices via an atomic counter and operate deterministically.
@@ -87,7 +89,17 @@ Parallel export (worker + writer) — TASK T7
 - Progress:
   - The trajectory export includes an indicatif ProgressBar with a background updater that reports states/sec, nodes/sec, ETA, and policy info.
 
-Determinisim specifics
+Per-worker transposition table — TASK T8
+- Each worker owns a fixed-size, direct-mapped transposition table (no sharing; no locks).
+- Default budget is 32 MiB per worker; configurable via --tt-bytes N (MiB).
+- Warming: in trajectory mode, a worker keeps its TT alive across all games it processes to maximise reuse.
+- Full mode uses a single TT of the same budget for the entire DFS export.
+- Rounding rule: the requested budget is rounded down to the largest power-of-two capacity that fits. Effective bytes are approximately capacity × entry_size.
+- Memory formula: total TT memory ≈ workers × tt-bytes.
+- Determinism: with identical seed + flags, output is byte-for-byte identical regardless of --tt-bytes (TT size does not influence labels).
+- Startup logs (one line per worker) show the chosen capacity, e.g.:
+  [worker 0] TT target=32 MiB capacity=8388608 entries ≈31.9 MiB
+Determinism specifics
 - Trajectory mode:
   - Labels (policy/value) are computed from full-depth perfect play at each ply; labels remain PV-optimal regardless of stepping strategy.
   - Off-PV stepping uses a per-ply RNG derived from (seed, game_id, turn) for deterministic sampling.
