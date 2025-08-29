@@ -9,6 +9,7 @@ use rayon::ThreadPoolBuilder;
 use serde::Serialize;
 use serde_json;
 use rand::Rng;
+use indicatif::{ProgressBar, ProgressStyle};
 
 use triplecargo::{
     load_cards_from_json, zobrist_key, Element, GameState, Owner, Rules, apply_move, legal_moves, score, rng_for_state,
@@ -789,6 +790,16 @@ fn pick_mcts_non_pv_move_from_dist(
     }
     Some(best.unwrap().0)
 }
+
+// --- Progress helpers for trajectory export ---
+//
+// Format seconds as HH:MM:SS
+fn format_hms(secs: u64) -> String {
+    let h = secs / 3600;
+    let m = (secs % 3600) / 60;
+    let s = secs % 60;
+    format!("{:02}:{:02}:{:02}", h, m, s)
+}
  
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
@@ -821,6 +832,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Precompute static resources for sampling
         let all_ids_sorted = all_card_ids_sorted(&cards);
         let bands_master = build_level_bands(&cards);
+                // Progress tracking (indicatif)
+                let mut nodes_total: u64 = 0;
+                let start_instant = Instant::now();
+                let mut last_tick = Instant::now();
+                let mut games_done: usize = 0;
+                let mut offpv_games_done: usize = 0;
+                let policy_info: String = match args.policy_format {
+                    PolicyFormatOpt::Mcts => format!("mcts@{}", args.mcts_rollouts),
+                    PolicyFormatOpt::Onehot => "onehot".to_string(),
+                };
+                let total_states: u64 = (args.games as u64) * 9;
+                let pb = ProgressBar::new(total_states);
+                pb.set_style(
+                    ProgressStyle::with_template("[{elapsed_precise}] traj {bar:40.cyan/blue} {pos}/{len} {msg}")
+                        .unwrap()
+                        .progress_chars("=>-"),
+                );
 
         match args.export_mode {
             ExportModeOpt::Trajectory => {
@@ -877,7 +905,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         // In trajectory mode we always search full remaining depth to obtain final-outcome value targets.
                         let eff_depth = 9 - state.board.filled_count();
 
-                        let (val, bm, child_vals, _nodes) = search_root_with_children(&state, &cards, eff_depth, &mut tt);
+                        let (val, bm, child_vals, nodes) = search_root_with_children(&state, &cards, eff_depth, &mut tt);
 
                         // Serialize current state record
                         let mut board_vec: Vec<BoardCell> = Vec::with_capacity(9);
@@ -940,6 +968,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         writer.write_all(line.as_bytes()).map_err(|e| format!("export write error: {e}"))?;
                         writer.write_all(b"\n").map_err(|e| format!("export write error: {e}"))?;
                         total_lines += 1;
+                        nodes_total = nodes_total.saturating_add(nodes);
+
+                        // Update progress at most once per second (indicatif)
+                        let now = Instant::now();
+                        if now.duration_since(last_tick).as_secs() >= 1 {
+                            let elapsed = now.duration_since(start_instant);
+                            let elapsed_secs = elapsed.as_secs().max(1);
+                            let states_done = total_lines as u64;
+                            let states_per_sec = states_done / elapsed_secs;
+                            let nodes_per_sec = nodes_total / elapsed_secs;
+                            let remaining_states = total_states.saturating_sub(states_done);
+                            let eta_secs = if states_per_sec > 0 { remaining_states / states_per_sec } else { 0 };
+                            let offpv_pct = if games_done > 0 {
+                                (offpv_games_done as f64) * 100.0 / (games_done as f64)
+                            } else {
+                                0.0
+                            };
+                            pb.set_position(states_done);
+                            pb.set_message(format!(
+                                "games {}/{} | states/s {} | nodes {:.1}M | nodes/s {:.1}M | offpv {}/{} ({:.1}%) | pol {} | ETA {}",
+                                games_done, games,
+                                states_per_sec,
+                                (nodes_total as f64) / 1.0e6,
+                                (nodes_per_sec as f64) / 1.0e6,
+                                offpv_games_done, games_done, offpv_pct,
+                                policy_info,
+                                format_hms(eta_secs),
+                            ));
+                            last_tick = now;
+                        }
 
                         // Choose next move based on off-PV setting
                         let next_mv = if off_pv_game {
@@ -977,7 +1035,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
 
-                    println!("{}/{} games computed", i + 1, games);
+                    // Game completed
+                    games_done = games_done.saturating_add(1);
+                    if off_pv_game {
+                        offpv_games_done = offpv_games_done.saturating_add(1);
+                    }
 
                     // Periodic flush
                     if total_lines % 10_000 == 0 {
@@ -985,6 +1047,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
 
+                // Finish progress bar
+                pb.set_position(total_states);
+                pb.finish_and_clear();
                 let _ = writer.flush();
                 let elapsed = t0.elapsed();
                 println!(

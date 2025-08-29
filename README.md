@@ -51,48 +51,60 @@ Triplecargo is both a research‑grade solver and the foundation for a superhuma
  
 📤 Training data export (JSONL)
 
-- Modes (via precompute):
-  - --export-mode trajectory (default): exports a single 9‑state principal‑variation trajectory per sampled game.
-  - --export-mode full: exports the entire reachable state space for one sampled hand pair (exhaustive).
+Overview
+- Export solver-labelled states to JSONL for training and analysis.
+- Two export modes:
+  - --export-mode trajectory (default): emits a single 9-state principal-variation trajectory per sampled game.
+  - --export-mode full: emits the entire reachable state space for one sampled hand pair (exhaustive).
+- Deterministic by design: same seed+flags → identical output (including elements layout, off-PV behaviour, and policy/value targets).
 
-- Determinism:
-  - --seed controls sampling (hands/elements) and, if mcts is selected, the rollout RNG.
-  - Same seed + flags → identical JSONL output (including Elemental layout and policy targets).
+Core flags
+- Output and mode
+  - --export PATH                JSONL output file
+  - --export-mode trajectory|full
+  - --games N                    number of games (trajectory mode only; full mode ignores this)
+- Sampling and determinism
+  - --seed U64                   master seed; controls hand sampling, per-ply RNG (off-PV), and MCTS rollouts
+  - --hand-strategy random|stratified
+  - --rules elemental,same,plus,same_wall (or 'none')
+  - --elements none|random       element layout (random is deterministic per game)
+- Policy and value targets
+  - --policy-format onehot|mcts
+  - --mcts-rollouts N            rollouts used when --policy-format mcts (default 100)
+  - --value-mode winloss|margin
+- Off-PV stepping (trajectory mode only)
+  - --off-pv-rate FLOAT [0..1]   per-game probability of off-PV stepping (0 disables)
+  - --off-pv-strategy random|weighted|mcts
+    - random: uniform over legal non-PV moves; if no alternative, fall back to PV.
+    - weighted: softmax over root child negamax Q values; PV mass set to 0, renormalised, then sampled.
+    - mcts: reuse root MCTS distribution when policy_format=mcts; otherwise compute root MCTS with --mcts-rollouts and sample after zeroing PV.
 
-- Value targets:
-  - --value-mode winloss (default): sign(value) from side‑to‑move perspective ∈ {-1, 0, +1}.
-  - --value-mode margin: final A‑perspective score margin (A_cards − B_cards) ∈ [-9, +9].
-
-- Hand sampling:
-  - --hand-strategy random: uniform without replacement from all 110 cards.
-  - --hand-strategy stratified: one card from each level band [1–2], [3–4], [5–6], [7–8], [9–10].
-
-- Elements:
-  - --elements none|random with deterministic per‑game element RNG when random is chosen.
-  - Element letter codes on export: F (Fire), I (Ice), T (Thunder), W (Water), E (Earth), P (Poison), H (Holy), L (Wind).
-
-- Policy targets:
-  - --policy-format onehot (default): exported as a single move object {"card_id":..., "cell":...}.
-  - --policy-format mcts: exported as a {"cardId-cell": prob} distribution over legal moves; --mcts-rollouts N (default 100) controls simulations.
-  - In terminal states: onehot → policy_target omitted (null), mcts → {} empty map.
-
-- JSONL writing:
-  - Lines are appended as they are generated (streaming), with periodic flushes; no buffering of entire games.
+Determinism specifics
+- Trajectory mode:
+  - Labels (policy/value) are computed from full-depth perfect play at each ply; labels remain PV-optimal regardless of stepping strategy.
+  - Off-PV stepping uses a per-ply RNG derived from (seed, game_id, turn) for deterministic sampling.
+- Full mode:
+  - Enumeration is deterministic. For optional MCTS policy distributions in full mode, rollout RNG derives from (seed XOR state_zobrist) to preserve traversal-order invariance.
+- With identical seeds and flags, the exported JSONL is byte-for-byte identical.
 
 CLI examples
 - Trajectory export (onehot), 10 games, no elements:
   - target/release/precompute --export export.jsonl --export-mode trajectory --games 10 --seed 42 --hand-strategy random --rules none --elements none --policy-format onehot --value-mode winloss
-- Trajectory export (MCTS with 256 rollouts), stratified hands, with Elemental+Same and margin targets:
+- Trajectory export (MCTS policy, 256 rollouts), stratified hands, Elemental+Same, margin values:
   - target/release/precompute --export export_mcts.jsonl --export-mode trajectory --games 10 --seed 42 --hand-strategy stratified --rules elemental,same --elements random --policy-format mcts --mcts-rollouts 256 --value-mode margin
+- Trajectory export with off-PV weighted stepping @ 20% games:
+  - target/release/precompute --export export_weighted.jsonl --export-mode trajectory --games 100 --seed 123 --hand-strategy random --rules none --elements none --policy-format onehot --off-pv-rate 0.2 --off-pv-strategy weighted
+- Trajectory export with off-PV mcts stepping, reusing policy distribution:
+  - target/release/precompute --export export_mcts_offpv.jsonl --export-mode trajectory --games 100 --seed 123 --hand-strategy stratified --rules elemental,same --elements random --policy-format mcts --mcts-rollouts 128 --off-pv-rate 0.2 --off-pv-strategy mcts
 - Full state‑space export (exhaustive) for one sampled hand pair:
   - target/release/precompute --export export_full.jsonl --export-mode full --seed 42 --hand-strategy random --rules none --elements none --policy-format onehot --value-mode winloss
 
 JSONL schema
-Each line contains one state. Fields:
+Each line contains one state emitted before a move is taken.
 
 {
-  "game_id": 12,                // sequential per sampled game (trajectory); full mode uses 0
-  "state_idx": 0,               // 0..8 within a game trajectory (equals "turn")
+  "game_id": 12,                // sequential per sampled game (trajectory); 0 in full mode
+  "state_idx": 0,               // 0..8 within a trajectory (equals "turn")
   "board": [
     {"cell":0,"card_id":12,"owner":"A","element":"F"}, // element present only when rules.elemental=true; otherwise omitted
     {"cell":1,"card_id":null,"owner":null,"element":null},
@@ -131,72 +143,57 @@ Each line contains one state. Fields:
   "state_hash": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4"
 }
 
-Notes
-- In trajectory mode, the solver searches full remaining depth at each ply to produce value_target consistent with final outcome.
-- In full mode, enumeration exports all reachable states for the single sampled hand pair (useful for analysis). For mcts in full mode, rollout RNG is derived from (seed XOR state Zobrist) for traversal‑order invariance.
+Export semantics
 
-📑 Export Semantics
-
-- 
 State timing
+- Each JSONL line represents the state before a move is made.
+- At turn = t, the board has t occupied cells; the side in to_move will play their (t+1)-th card next.
+- Hands shrink accordingly; at the final turn = 8 there is still one card left (and a policy_target showing where it will be placed).
 
-
-	- Each JSONL line represents the state before a move is made.
-	- At turn = t, the board has t occupied cells, and the side in to_move is about to play their (t+1)‑th card.
-	- Hands shrink accordingly, but at the final turn = 8 there is still one card left in the mover’s hand and a policy_target showing where it will be placed.
-- 
 Policy targets
+- --policy-format onehot:
+  - Exported as a single best-move object:
+    "policy_target": {"card_id": 34, "cell": 0}
+- --policy-format mcts:
+  - Exported as a {"cardId-cell": prob} map over legal moves:
+    "policy_target": {"34-0": 0.7, "56-1": 0.3}
+- Terminal states:
+  - onehot → policy_target omitted (null).
+  - mcts → empty map {}.
 
+Off-PV stepping (trajectory mode)
+- Labels remain PV-optimal: policy/value targets reflect perfect play; stepping only affects which move is played next to advance the trajectory.
+- Per-game activation: with probability --off-pv-rate a game uses off-PV stepping for all its plies.
+- Strategies:
+  - random:
+    - Uniform over legal non-PV moves. If no alternative exists, fall back to the PV move (or None at terminal).
+  - weighted:
+    - Use root child negamax values (Q). Compute softmax(Q), set PV move probability to 0, renormalise, sample with a deterministic RNG derived from (seed, game_id, turn).
+    - If no alternative exists, fall back to PV.
+  - mcts:
+    - If --policy-format mcts, reuse the root MCTS distribution computed for policy_target; otherwise compute a fresh root MCTS with --mcts-rollouts (deterministic per-ply seed).
+    - Set PV probability to 0, renormalise, sample deterministically.
+    - Fallback: if the PV move had all probability mass (sum of non-PV probs == 0), select the highest-probability non-PV move deterministically.
 
-	- --policy-format onehot:
-		- Exported as a single move object:
-
-	"policy_target": {"card_id": 34, "cell": 0}
-
-
-
-	- --policy-format mcts:
-		- Exported as a distribution over legal moves:
-
-	"policy_target": {"34-0": 0.7, "56-1": 0.3}
-
-
-
-	- Terminal states:
-		- onehot → policy_target omitted (null).
-		- mcts → empty map {}.
-- 
-	- Off-PV stepping (strategy=mcts):
-		- When --off-pv-strategy mcts is active:
-			- If --policy-format mcts is selected, the root MCTS distribution computed for policy_target is reused for stepping.
-			- Otherwise, a root MCTS distribution is computed with --mcts-rollouts at each ply using a deterministic per-ply seed.
-			- The PV move’s probability is set to 0 and the distribution is renormalised; the next move is sampled deterministically via a per-ply RNG tied to (seed, game_id, turn).
-			- Fallback: if the PV move had all probability mass (sum of non-PV probs == 0), the highest-probability non-PV move is selected deterministically.
 Value targets
+- --value-mode winloss:
+  - value ∈ {-1, 0, +1}, always from side-to-move perspective.
+    - +1 = side-to-move wins under perfect play
+    - 0  = draw
+    - −1 = side-to-move loses
+- --value-mode margin:
+  - integer final score difference (A_cards − B_cards), always from A’s perspective, independent of who is to move.
+- Values are computed by solving the full remaining depth at each ply, so they match final outcomes.
 
+Elements
+- When rules.elemental = true, each board cell includes an "element" field with one of: F, I, T, W, E, P, H, L.
+- Otherwise the "element" field is omitted.
 
-	- Controlled by --value-mode:
-		- winloss: value ∈ {-1, 0, +1}, always from the side‑to‑move perspective.
-			- +1 = side‑to‑move wins under perfect play.
-			- 0 = draw.
-			- −1 = side‑to‑move loses.
-		- margin: integer final score difference (A_cards − B_cards), always from A’s perspective, independent of side‑to‑move.
-	- Values are computed by solving the full remaining depth at each ply, so they are consistent with the final outcome.
-- 
-Elemental layout
-
-
-	- When rules.elemental = true, each board cell includes an "element" field with one of:
-		- "F" (Fire), "I" (Ice), "T" (Thunder), "W" (Water), "E" (Earth), "P" (Poison), "H" (Holy), "L" (Wind).
-	- Otherwise, the "element" field is omitted.
-- 
 Metadata
-
-
-	- game_id: sequential per sampled game in trajectory mode; fixed 0 in full mode.
-	- state_idx: 0..8 within a trajectory (equals turn).
-	- off_pv: boolean flag indicating off-principal-variation sampling; true for all lines of off-PV games, false otherwise.
-	- state_hash: 128‑bit Zobrist hash of the state, hex string.
+- game_id: sequential per sampled game (trajectory); 0 in full mode.
+- state_idx: 0..8 within a trajectory (equals turn).
+- off_pv: true for all lines of off-PV games; false otherwise.
+- state_hash: 128‑bit Zobrist hash of the state, hex string.
 
 🕹️ Rules implemented
 
