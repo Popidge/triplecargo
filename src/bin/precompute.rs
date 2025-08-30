@@ -9,8 +9,10 @@ use std::time::Instant;
 use clap::{Parser, ValueEnum};
 use indicatif::{ProgressBar, ProgressStyle};
 use rand::Rng;
-use serde::Serialize;
+use serde::{Serialize, Deserialize};
 use serde_json;
+use std::io::{self, BufRead};
+use std::process;
 
 use triplecargo::{
     load_cards_from_json, zobrist_key, Element, GameState, Owner, Rules, apply_move, legal_moves, score, rng_for_state,
@@ -53,6 +55,14 @@ enum OffPvStrategyOpt {
     Random,
     Weighted,
     Mcts,
+}
+
+#[derive(Debug, Clone, ValueEnum)]
+enum PlayStrategyOpt {
+    Pv,
+    Mcts,
+    Heuristic,
+    Mix,
 }
 
 #[derive(Debug, Parser)]
@@ -118,6 +128,36 @@ struct Args {
     #[arg(long, value_enum, default_value_t = OffPvStrategyOpt::Weighted)]
     off_pv_strategy: OffPvStrategyOpt,
 
+    /// Play strategy for advancing the trajectory: pv | mcts | heuristic | mix
+    #[arg(long, value_enum, default_value_t = PlayStrategyOpt::Mix)]
+    play_strategy: PlayStrategyOpt,
+
+    /// Progressive mix: heuristic weight at early game (turn=0)
+    #[arg(long, default_value_t = 0.65)]
+    mix_heuristic_early: f32,
+
+    /// Progressive mix: heuristic weight at late game (turn=8)
+    #[arg(long, default_value_t = 0.10)]
+    mix_heuristic_late: f32,
+
+    /// Progressive mix: MCTS fixed weight (only when --policy-format mcts)
+    #[arg(long, default_value_t = 0.25)]
+    mix_mcts: f32,
+
+    /// Heuristic weights
+    #[arg(long = "heur-w-corner", default_value_t = 1.0)]
+    heur_w_corner: f32,
+    #[arg(long = "heur-w-edge", default_value_t = 0.3)]
+    heur_w_edge: f32,
+    #[arg(long = "heur-w-center", default_value_t = -0.2)]
+    heur_w_center: f32,
+    #[arg(long = "heur-w-greedy", default_value_t = 0.8)]
+    heur_w_greedy: f32,
+    #[arg(long = "heur-w-defense", default_value_t = 0.6)]
+    heur_w_defense: f32,
+    #[arg(long = "heur-w-element", default_value_t = 0.6)]
+    heur_w_element: f32,
+
     /// Value target mode: winloss | margin
     #[arg(
         long = "value-mode",
@@ -132,6 +172,14 @@ struct Args {
     /// Transposition table size per worker in MiB (rounded down to a power-of-two capacity under the budget)
     #[arg(long = "tt-bytes", default_value_t = 32, value_name = "MiB")]
     tt_bytes: usize,
+
+    /// Evaluate a single state from stdin; emits exactly one JSON object to stdout
+    #[arg(long = "eval-state")]
+    eval_state: bool,
+
+    /// Verbose diagnostics to stderr (eval mode only)
+    #[arg(long)]
+    verbose: bool,
 }
 
 fn parse_rules(s: &str) -> Rules {
@@ -187,7 +235,7 @@ fn gen_elements(seed: u64) -> [Option<Element>; 9] {
     arr
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 struct BoardCell {
     cell: u8,
     card_id: Option<u16>,
@@ -196,7 +244,7 @@ struct BoardCell {
     element: Option<Option<char>>,
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 struct HandsRecord {
     #[serde(rename = "A")]
     a: Vec<u16>,
@@ -488,6 +536,387 @@ fn parse_move_key(key: &str) -> Option<triplecargo::Move> {
     Some(triplecargo::Move { card_id, cell: cell_u })
 }
 
+#[derive(Clone, Copy)]
+struct HeurWeights {
+    corner: f32,
+    edge: f32,
+    center: f32,
+    greedy: f32,
+    defense: f32,
+    element: f32,
+}
+
+#[inline]
+fn cell_category_local(cell: u8) -> u8 {
+    match cell {
+        0 | 2 | 6 | 8 => 0, // corners
+        4 => 2,             // center
+        _ => 1,             // edges
+    }
+}
+
+#[inline]
+fn elemental_delta_local(cell_elem: Option<Element>, card_elem: Option<Element>) -> i16 {
+    match cell_elem {
+        None => 0,
+        Some(e) => {
+            if card_elem == Some(e) { 1 } else { -1 }
+        }
+    }
+}
+
+#[inline]
+fn clamp_side_local(v: i16) -> u8 {
+    v.clamp(1, 10) as u8
+}
+
+#[inline]
+fn adjusted_sides_for_cell_local(
+    card: &triplecargo::Card,
+    cell_idx: u8,
+    board: &triplecargo::Board,
+    rules: &Rules,
+) -> [u8; 4] {
+    if !rules.elemental {
+        return [card.top, card.right, card.bottom, card.left];
+    }
+    let delta = elemental_delta_local(board.cell_element(cell_idx), card.element) as i16;
+    if delta == 0 {
+        return [card.top, card.right, card.bottom, card.left];
+    }
+    let sides = [card.top, card.right, card.bottom, card.left];
+    [
+        clamp_side_local(sides[0] as i16 + delta),
+        clamp_side_local(sides[1] as i16 + delta),
+        clamp_side_local(sides[2] as i16 + delta),
+        clamp_side_local(sides[3] as i16 + delta),
+    ]
+}
+
+fn heuristic_scores_for_legal(
+    state: &GameState,
+    cards: &triplecargo::CardsDb,
+    weights: &HeurWeights,
+) -> (Vec<triplecargo::Move>, Vec<f32>) {
+    let moves = legal_moves(state);
+    if moves.is_empty() {
+        return (moves, Vec::new());
+    }
+
+    let before_score = score(state);
+    let to_move = state.next;
+
+    let mut scores: Vec<f32> = Vec::with_capacity(moves.len());
+
+    for mv in &moves {
+        // Positional category
+        let cat = cell_category_local(mv.cell);
+        let pos_bonus = match cat {
+            0 => weights.corner,
+            1 => weights.edge,
+            _ => weights.center,
+        };
+
+        // Element synergy (only when elemental rules)
+        let elem_bonus = if state.rules.elemental {
+            match state.board.cell_element(mv.cell) {
+                Some(e) => {
+                    // match => +w_element, mismatch or no-element card => -w_element
+                    match cards.get(mv.card_id) {
+                        Some(c) => {
+                            if c.element == Some(e) { weights.element } else { -weights.element }
+                        }
+                        None => 0.0,
+                    }
+                }
+                None => 0.0,
+            }
+        } else {
+            0.0
+        };
+
+        // Greedy gain: simulate move and compute delta margin from mover's perspective
+        let greedy_gain = match apply_move(state, cards, *mv) {
+            Ok(sim) => {
+                let after_score = score(&sim);
+                let delta = (after_score as i16 - before_score as i16) as i8;
+                if to_move == Owner::A { delta as f32 } else { -(delta as f32) }
+            }
+            Err(_) => 0.0,
+        };
+
+        // Defensive exposure: penalize low exposed sides and immediate threats from existing neighbors
+        let defense_penalty = match cards.get(mv.card_id) {
+            Some(card) => {
+                let placed_sides = adjusted_sides_for_cell_local(card, mv.cell, &state.board, &state.rules);
+                let neighs = state.board.neighbors(mv.cell);
+                let mut pen: f32 = 0.0;
+                for (i, opt_nidx) in neighs.iter().enumerate() {
+                    let our_side = placed_sides[i] as i16;
+                    match opt_nidx {
+                        Some(nidx) => {
+                            if let Some(nslot) = state.board.get(*nidx) {
+                                // If neighbor occupied by opponent, see if its touching side beats ours
+                                if nslot.owner != to_move {
+                                    if let Some(nc) = cards.get(nslot.card_id) {
+                                        let nsides = adjusted_sides_for_cell_local(nc, *nidx, &state.board, &state.rules);
+                                        let opp_idx = (i + 2) % 4;
+                                        let neigh_side = nsides[opp_idx] as i16;
+                                        if neigh_side > our_side {
+                                            pen += ((neigh_side - our_side) as f32) / 10.0;
+                                        }
+                                    }
+                                }
+                            } else {
+                                // Empty neighbor: general exposure penalty inversely proportional to our side
+                                pen += ((10 - (our_side as i16).clamp(1, 10)) as f32) / 10.0;
+                            }
+                        }
+                        None => {
+                            // Wall: no exposure
+                        }
+                    }
+                }
+                pen
+            }
+            None => 0.0,
+        };
+
+        let score_total =
+            pos_bonus +
+            weights.greedy * greedy_gain +
+            (-weights.defense) * defense_penalty +
+            elem_bonus;
+
+        scores.push(score_total);
+    }
+
+    (moves, scores)
+}
+
+fn softmax_probs(scores: &[f32]) -> Vec<f32> {
+    if scores.is_empty() {
+        return Vec::new();
+    }
+    let mut maxv = f32::NEG_INFINITY;
+    for &s in scores {
+        if s.is_finite() && s > maxv {
+            maxv = s;
+        }
+    }
+    if !maxv.is_finite() {
+        // fallback to uniform
+        let n = scores.len();
+        return vec![1.0 / (n as f32); n];
+    }
+    let mut expv: Vec<f32> = Vec::with_capacity(scores.len());
+    let mut sum = 0.0f32;
+    for &s in scores {
+        let e = (s - maxv).exp();
+        expv.push(e);
+        sum += e;
+    }
+    if sum <= 0.0 || !sum.is_finite() {
+        let n = scores.len();
+        return vec![1.0 / (n as f32); n];
+    }
+    expv.into_iter().map(|e| e / sum).collect()
+}
+
+fn map_mcts_to_probs(moves: &[triplecargo::Move], dist: &BTreeMap<String, f32>) -> Vec<f32> {
+    if moves.is_empty() {
+        return Vec::new();
+    }
+    let mut probs: Vec<f32> = Vec::with_capacity(moves.len());
+    let mut sum = 0.0f32;
+    for mv in moves {
+        let key = format!("{}-{}", mv.card_id, mv.cell);
+        let p = *dist.get(&key).unwrap_or(&0.0);
+        probs.push(p.max(0.0));
+        sum += p.max(0.0);
+    }
+    if sum > 0.0 && sum.is_finite() {
+        probs.iter().map(|p| *p / sum).collect()
+    } else {
+        // fallback to uniform
+        vec![1.0 / (moves.len() as f32); moves.len()]
+    }
+}
+
+fn pv_probs(moves: &[triplecargo::Move], bm: Option<triplecargo::Move>) -> Vec<f32> {
+    if moves.is_empty() {
+        return Vec::new();
+    }
+    if let Some(b) = bm {
+        if let Some(pos) = moves.iter().position(|m| *m == b) {
+            let mut v = vec![0.0f32; moves.len()];
+            v[pos] = 1.0;
+            return v;
+        }
+    }
+    // fallback: uniform
+    vec![1.0 / (moves.len() as f32); moves.len()]
+}
+
+#[inline]
+fn lerp(a: f32, b: f32, t: f32) -> f32 {
+    a + (b - a) * t
+}
+
+fn mix_probs(
+    pv: &[f32],
+    mcts: Option<&[f32]>,
+    heur: &[f32],
+    turn: u8,
+    mix_heuristic_early: f32,
+    mix_heuristic_late: f32,
+    mix_mcts: f32,
+    mcts_available: bool,
+) -> Vec<f32> {
+    let n = pv.len();
+    let mut out = vec![0.0f32; n];
+    if n == 0 {
+        return out;
+    }
+    let frac = (turn as f32 / 8.0).clamp(0.0, 1.0);
+    let mut w_heur = lerp(mix_heuristic_early, mix_heuristic_late, frac).clamp(0.0, 1.0);
+    let mut w_mcts = if mcts_available { mix_mcts } else { 0.0 };
+    w_mcts = w_mcts.clamp(0.0, 1.0);
+    let mut w_pv = 1.0 - w_heur - w_mcts;
+    if w_pv < 0.0 {
+        // Renormalize proportionally
+        let sum_pos = (w_heur.max(0.0)) + (w_mcts.max(0.0));
+        if sum_pos > 0.0 {
+            w_heur = w_heur.max(0.0) / sum_pos;
+            w_mcts = w_mcts.max(0.0) / sum_pos;
+            w_pv = 0.0;
+        } else {
+            // all zero or negative, default to PV
+            w_heur = 0.0;
+            w_mcts = 0.0;
+            w_pv = 1.0;
+        }
+    }
+
+    for i in 0..n {
+        let mut p = w_pv * pv[i] + w_heur * heur[i];
+        if let Some(m) = mcts {
+            p += w_mcts * m[i];
+        }
+        out[i] = p.max(0.0);
+    }
+    // Normalize
+    let mut s = 0.0f32;
+    for &p in &out {
+        s += p;
+    }
+    if s > 0.0 && s.is_finite() {
+        for p in &mut out {
+            *p /= s;
+        }
+    } else {
+        // fallback to PV
+        return pv.to_vec();
+    }
+    out
+}
+
+fn sample_from_probs(
+    moves: &[triplecargo::Move],
+    probs: &[f32],
+    seed: u64,
+    game_id: u64,
+    turn: u8,
+) -> Option<triplecargo::Move> {
+    if moves.is_empty() || probs.is_empty() || moves.len() != probs.len() {
+        return None;
+    }
+    let mut rng = rng_for_state(seed, game_id, turn);
+    let r: f64 = rng.gen::<f64>();
+    let mut acc: f64 = 0.0;
+    for (i, &p) in probs.iter().enumerate() {
+        acc += (p as f64);
+        if r < acc {
+            return Some(moves[i]);
+        }
+    }
+    Some(moves[moves.len() - 1])
+}
+
+fn choose_next_move_heuristic(
+    state: &GameState,
+    cards: &triplecargo::CardsDb,
+    weights: &HeurWeights,
+    seed: u64,
+    game_id: u64,
+    turn: u8,
+) -> Option<triplecargo::Move> {
+    let (moves, scores) = heuristic_scores_for_legal(state, cards, weights);
+    if moves.is_empty() {
+        return None;
+    }
+    let probs = softmax_probs(&scores);
+    sample_from_probs(&moves, &probs, seed, game_id, turn)
+}
+
+fn choose_next_move_mcts(
+    state: &GameState,
+    mcts_dist: &BTreeMap<String, f32>,
+    seed: u64,
+    game_id: u64,
+    turn: u8,
+) -> Option<triplecargo::Move> {
+    let moves = legal_moves(state);
+    if moves.is_empty() {
+        return None;
+    }
+    let probs = map_mcts_to_probs(&moves, mcts_dist);
+    sample_from_probs(&moves, &probs, seed, game_id, turn)
+}
+
+fn choose_next_move_mixed(
+    state: &GameState,
+    cards: &triplecargo::CardsDb,
+    pv: Option<triplecargo::Move>,
+    mcts_dist: Option<&BTreeMap<String, f32>>,
+    seed: u64,
+    game_id: u64,
+    turn: u8,
+    mix_heuristic_early: f32,
+    mix_heuristic_late: f32,
+    mix_mcts: f32,
+    weights: &HeurWeights,
+    mcts_available: bool,
+) -> Option<triplecargo::Move> {
+    let moves = legal_moves(state);
+    if moves.is_empty() {
+        return None;
+    }
+
+    // PV distribution
+    let pv_p = pv_probs(&moves, pv);
+
+    // Heuristic distribution
+    let (_m2, scores) = heuristic_scores_for_legal(state, cards, weights);
+    let heur_p = softmax_probs(&scores);
+
+    // Optional MCTS distribution
+    let mcts_p_vec = mcts_dist.map(|d| map_mcts_to_probs(&moves, d));
+
+    // Mix
+    let mixed = mix_probs(
+        &pv_p,
+        mcts_p_vec.as_deref(),
+        &heur_p,
+        turn,
+        mix_heuristic_early,
+        mix_heuristic_late,
+        mix_mcts,
+        mcts_available && mcts_p_vec.is_some(),
+    );
+
+    sample_from_probs(&moves, &mixed, seed, game_id, turn)
+}
 fn pick_mcts_non_pv_move_from_dist(
     dist: &BTreeMap<String, f32>,
     pv: Option<triplecargo::Move>,
@@ -542,10 +971,425 @@ fn format_hms(secs: u64) -> String {
     format!("{:02}:{:02}:{:02}", h, m, s)
 }
 
+// ---- Eval-state mode: input schema, helpers, and driver ----
+
+#[derive(Debug, Deserialize)]
+struct EvalInputHands {
+    #[serde(rename = "A")]
+    a: Vec<u16>,
+    #[serde(rename = "B")]
+    b: Vec<u16>,
+}
+
+#[derive(Debug, Deserialize)]
+struct EvalInputCell {
+    cell: u8,
+    #[serde(default)]
+    card_id: Option<u16>,
+    #[serde(default)]
+    owner: Option<char>, // 'A' | 'B'
+    // When rules.elemental=true, export lines may include element per cell; accept here too.
+    #[serde(default)]
+    element: Option<char>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ApplyReq {
+    card_id: u16,
+    cell: u8,
+}
+
+#[derive(Debug, Deserialize)]
+struct EvalInput {
+    board: Vec<EvalInputCell>,
+    hands: EvalInputHands,
+    to_move: char,                   // 'A' | 'B'
+    #[serde(default)]
+    turn: Option<u8>,                // optional; if present must match board filled count
+    rules: Rules,
+    // Optional; if present, must match board[].element
+    #[serde(default)]
+    board_elements: Option<Vec<Option<char>>>,
+    // Optional apply step; when present, perform a single move and return the new state
+    #[serde(default)]
+    apply: Option<ApplyReq>,
+}
+
+#[derive(Debug, Serialize)]
+struct EvalMoveOut {
+    card_id: u16,
+    cell: u8,
+}
+
+#[derive(Debug, Serialize)]
+struct EvalOut {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    best_move: Option<EvalMoveOut>,
+    value: i8,           // {-1,0,1} from side-to-move perspective
+    margin: i8,          // A_cards − B_cards at terminal
+    pv: Vec<EvalMoveOut>,
+    nodes: u64,
+    depth: u8,           // remaining plies searched
+    state_hash: String,  // 128-bit zobrist hex
+}
+
+#[derive(Debug, Serialize)]
+struct ApplyStateOut {
+    board: Vec<BoardCell>,
+    hands: HandsRecord,
+    to_move: char,
+    turn: u8,
+    rules: Rules,
+}
+
+#[derive(Debug, Serialize)]
+struct OutcomeOut {
+    mode: String,            // "winloss"
+    value: i8,               // {-1,0,1} from A perspective
+    #[serde(skip_serializing_if = "Option::is_none")]
+    winner: Option<char>,    // 'A' | 'B' | null for draw / non-terminal
+}
+
+#[derive(Debug, Serialize)]
+struct ApplyOut {
+    state: ApplyStateOut,
+    done: bool,
+    outcome: OutcomeOut,
+    state_hash: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ErrorOut {
+    error: String,
+}
+
+#[inline]
+fn elem_from_letter(ch: char) -> Result<Element, String> {
+    match ch {
+        'F' => Ok(Element::Fire),
+        'I' => Ok(Element::Ice),
+        'T' => Ok(Element::Thunder),
+        'W' => Ok(Element::Water),
+        'E' => Ok(Element::Earth),
+        'P' => Ok(Element::Poison),
+        'H' => Ok(Element::Holy),
+        'L' => Ok(Element::Wind),
+        other => Err(format!("Invalid element letter '{other}' (expected one of F,I,T,W,E,P,H,L)")),
+    }
+}
+
+fn build_state_from_eval_input(inp: &EvalInput, cards: &triplecargo::CardsDb) -> Result<GameState, String> {
+    // Derive per-cell elements from board_elements (preferred) or from board[].element
+    let mut derived_from_cells: Option<[Option<Element>; 9]> = None;
+    if inp.board.iter().any(|c| c.element.is_some()) {
+        let mut arr: [Option<Element>; 9] = [None; 9];
+        for cell in &inp.board {
+            if let Some(el) = cell.element {
+                let e = elem_from_letter(el)?;
+                if (cell.cell as usize) >= 9 {
+                    return Err(format!("Board cell index {} out of range 0..8", cell.cell));
+                }
+                arr[cell.cell as usize] = Some(e);
+            }
+        }
+        derived_from_cells = Some(arr);
+    }
+
+    let mut from_top: Option<[Option<Element>; 9]> = None;
+    if let Some(v) = &inp.board_elements {
+        if v.len() != 9 {
+            return Err(format!("board_elements must have length 9, got {}", v.len()));
+        }
+        let mut arr: [Option<Element>; 9] = [None; 9];
+        for i in 0..9usize {
+            arr[i] = match v[i] {
+                Some(ch) => Some(elem_from_letter(ch)?),
+                None => None,
+            };
+        }
+        from_top = Some(arr);
+    }
+
+    // If both present, they must match
+    let cell_elements: Option<[Option<Element>; 9]> = match (from_top, derived_from_cells) {
+        (Some(a), Some(b)) => {
+            for i in 0..9 {
+                if a[i] != b[i] {
+                    return Err(format!("Element mismatch at cell {} between board_elements and board[].element", i));
+                }
+            }
+            Some(a)
+        }
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    };
+
+    // Start state with or without elements
+    let mut s = if let Some(elems) = cell_elements {
+        GameState::with_elements(inp.rules, elems)
+    } else {
+        GameState::new_empty(inp.rules)
+    };
+
+    // Populate board occupants
+    for cell in &inp.board {
+        if let (Some(card_id), Some(owner_ch)) = (cell.card_id, cell.owner) {
+            if (cell.cell as usize) >= 9 {
+                return Err(format!("Board cell index {} out of range 0..8", cell.cell));
+            }
+            if !s.board.is_empty(cell.cell) {
+                return Err(format!("Duplicate occupant for cell {}", cell.cell));
+            }
+            if cards.get(card_id).is_none() {
+                return Err(format!("Card id {} not found in cards DB", card_id));
+            }
+            let owner = match owner_ch {
+                'A' => Owner::A,
+                'B' => Owner::B,
+                _ => return Err(format!("Invalid owner '{}' (expected 'A' or 'B')", owner_ch)),
+            };
+            let slot = triplecargo::board::Slot { owner, card_id };
+            s.board.set(cell.cell, Some(slot));
+        }
+    }
+
+    // Populate hands (sorted ascending for stability)
+    let mut a_sorted = inp.hands.a.clone();
+    let mut b_sorted = inp.hands.b.clone();
+    a_sorted.sort_unstable();
+    b_sorted.sort_unstable();
+    if a_sorted.len() > 5 || b_sorted.len() > 5 {
+        return Err("Hands arrays must be length <= 5".to_string());
+    }
+    s.hands_a = [None; 5];
+    s.hands_b = [None; 5];
+    for (i, id) in a_sorted.iter().copied().enumerate() {
+        s.hands_a[i] = Some(id);
+    }
+    for (i, id) in b_sorted.iter().copied().enumerate() {
+        s.hands_b[i] = Some(id);
+    }
+
+    // Side to move
+    s.next = match inp.to_move {
+        'A' => Owner::A,
+        'B' => Owner::B,
+        other => return Err(format!("Invalid to_move '{}' (expected 'A' or 'B')", other)),
+    };
+
+    // Recompute zobrist to ensure consistency
+    s.zobrist = triplecargo::hash::recompute_zobrist(&s);
+
+    // Optional validation for turn
+    if let Some(t) = inp.turn {
+        let filled = s.board.filled_count();
+        if t != filled {
+            return Err(format!("turn mismatch: provided {}, but board has {} occupied cells", t, filled));
+        }
+    }
+
+    Ok(s)
+}
+
+fn eval_state_main(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
+    // Mutual exclusivity check (basic)
+    if args.export.is_some() {
+        eprintln!("--eval-state is mutually exclusive with --export");
+        std::process::exit(2);
+    }
+
+    // Preload cards once
+    let cards = match load_cards_from_json(&args.cards) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Cards load error: {e}");
+            process::exit(1);
+        }
+    };
+
+    // Allocate a TT once (reused across requests)
+    let budget_bytes = args.tt_bytes.saturating_mul(1024 * 1024);
+    let cap = FixedTT::capacity_for_budget_bytes(budget_bytes);
+    let mut tt = FixedTT::with_capacity_pow2(cap);
+
+    let stdin = io::stdin();
+    let mut lines = stdin.lock().lines();
+
+    while let Some(line_res) = lines.next() {
+        let line = match line_res {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("stdin read error: {e}");
+                process::exit(1);
+            }
+        };
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        // Parse one request per line
+        let inp: EvalInput = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("Invalid JSON: {e}");
+                process::exit(1);
+            }
+        };
+
+        // Build input state
+        let state0 = match build_state_from_eval_input(&inp, &cards) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("State build error: {e}");
+                process::exit(1);
+            }
+        };
+
+        if let Some(app) = inp.apply {
+            // Apply request
+            let mv = triplecargo::Move { card_id: app.card_id, cell: app.cell };
+            match apply_move(&state0, &cards, mv) {
+                Ok(state1) => {
+                    // Prepare board vector (include element when elemental is on)
+                    let mut board_vec: Vec<BoardCell> = Vec::with_capacity(9);
+                    let elemental_enabled = state1.rules.elemental;
+                    for cell in 0u8..9 {
+                        let slot = state1.board.get(cell);
+                        let (card_id, owner): (Option<u16>, Option<char>) = match slot {
+                            Some(s) => (Some(s.card_id), Some(match s.owner { Owner::A => 'A', Owner::B => 'B' })),
+                            None => (None, None),
+                        };
+                        let element_field: Option<Option<char>> = if elemental_enabled {
+                            Some(state1.board.cell_element(cell).map(element_letter))
+                        } else {
+                            None
+                        };
+                        board_vec.push(BoardCell { cell, card_id, owner, element: element_field });
+                    }
+
+                    // Hands snapshot (compact)
+                    let mut ha: Vec<u16> = Vec::with_capacity(5);
+                    let mut hb: Vec<u16> = Vec::with_capacity(5);
+                    for &o in state1.hands_a.iter() { if let Some(id) = o { ha.push(id); } }
+                    for &o in state1.hands_b.iter() { if let Some(id) = o { hb.push(id); } }
+                    let hands = HandsRecord { a: ha, b: hb };
+
+                    let to_move = match state1.next { Owner::A => 'A', Owner::B => 'B' };
+                    let turn = state1.board.filled_count();
+
+                    let done = state1.is_terminal();
+                    let (out_value, winner) = if done {
+                        let m = score(&state1);
+                        let v = if m > 0 { 1 } else if m < 0 { -1 } else { 0 };
+                        let w = if m > 0 { Some('A') } else if m < 0 { Some('B') } else { None };
+                        (v, w)
+                    } else {
+                        (0, None)
+                    };
+
+                    let resp = ApplyOut {
+                        state: ApplyStateOut {
+                            board: board_vec,
+                            hands,
+                            to_move,
+                            turn,
+                            rules: state1.rules,
+                        },
+                        done,
+                        outcome: OutcomeOut {
+                            mode: "winloss".to_string(),
+                            value: out_value,
+                            winner,
+                        },
+                        state_hash: format!("{:032x}", zobrist_key(&state1)),
+                    };
+
+                    println!("{}", serde_json::to_string(&resp).expect("serialize apply json"));
+                    let _ = io::stdout().flush();
+                }
+                Err(e) => {
+                    // Produce an error object for invalid apply without breaking the stream
+                    let err = ErrorOut { error: format!("apply error: {e}") };
+                    println!("{}", serde_json::to_string(&err).expect("serialize error json"));
+                    let _ = io::stdout().flush();
+                }
+            }
+        } else {
+            // Eval request (search)
+            let depth: u8 = 9u8 - state0.board.filled_count();
+            let (val, bm, nodes) = search_root(&state0, &cards, depth, &mut tt);
+
+            // Reconstruct PV up to remaining depth and ensure terminal by continuing perfect play
+            let mut pv_moves = triplecargo::solver::reconstruct_pv(&state0, &cards, &tt, depth as usize);
+
+            let mut sim = state0.clone();
+            for mv in &pv_moves {
+                match apply_move(&sim, &cards, *mv) {
+                    Ok(ns) => sim = ns,
+                    Err(e) => {
+                        eprintln!("Internal error applying PV move: {e}");
+                        process::exit(1);
+                    }
+                }
+            }
+            while !sim.is_terminal() {
+                let rem = 9u8 - sim.board.filled_count();
+                let (_v2, bm2, _n2) = search_root(&sim, &cards, rem, &mut tt);
+                match bm2 {
+                    Some(mv) => {
+                        pv_moves.push(mv);
+                        match apply_move(&sim, &cards, mv) {
+                            Ok(ns) => sim = ns,
+                            Err(e) => {
+                                eprintln!("Internal error applying move while finishing PV: {e}");
+                                process::exit(1);
+                            }
+                        }
+                    }
+                    None => break,
+                }
+            }
+
+            let margin = score(&sim);
+
+            let best_move_out = bm.map(|m| EvalMoveOut { card_id: m.card_id, cell: m.cell });
+            let pv_out: Vec<EvalMoveOut> = pv_moves
+                .into_iter()
+                .map(|m| EvalMoveOut { card_id: m.card_id, cell: m.cell })
+                .collect();
+
+            let out = EvalOut {
+                best_move: best_move_out, // omitted at terminal
+                value: if val > 0 { 1 } else if val < 0 { -1 } else { 0 },
+                margin,
+                pv: pv_out,
+                nodes,
+                depth,
+                state_hash: format!("{:032x}", zobrist_key(&state0)),
+            };
+
+            if args.verbose {
+                eprintln!("[eval] nodes={} depth={}", nodes, depth);
+            }
+
+            println!("{}", serde_json::to_string(&out).expect("serialize eval json"));
+            let _ = io::stdout().flush();
+        }
+    }
+
+    Ok(())
+}
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
-    let t0 = Instant::now();
 
+    // Eval-state fast path: strict stdin -> stdout JSON, no extra stdout logs
+    if args.eval_state {
+        return eval_state_main(&args);
+    }
+
+    let t0 = Instant::now();
+ 
     // Load cards
     let cards = load_cards_from_json(&args.cards).map_err(|e| format!("Cards load error: {e}"))?;
     println!("[precompute_new] Loaded {} cards (max id {}).", cards.len(), cards.max_id());
@@ -616,8 +1460,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             });
 
             println!(
-                "[export] Mode=trajectory games={} hand_strategy={:?} seed={:#x} policy_format={:?} value_mode={:?} off_pv_rate={} off_pv_strategy={:?}",
-                games, args.hand_strategy, args.seed, args.policy_format, args.value_mode, args.off_pv_rate, args.off_pv_strategy
+                "[export] Mode=trajectory games={} hand_strategy={:?} seed={:#x} policy_format={:?} value_mode={:?} play_strategy={:?} off_pv_rate={} off_pv_strategy={:?}",
+                games, args.hand_strategy, args.seed, args.policy_format, args.value_mode, args.play_strategy, args.off_pv_rate, args.off_pv_strategy
             );
 
             // Determine worker count
@@ -707,6 +1551,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let tt_mib = args.tt_bytes;
                 let chunk_size = effective_chunk_size;
 
+                // New: play strategy and heuristic/mix parameters
+                let play_strategy = args.play_strategy.clone();
+                let mix_heuristic_early = args.mix_heuristic_early;
+                let mix_heuristic_late = args.mix_heuristic_late;
+                let mix_mcts = args.mix_mcts;
+                let heur_w_corner = args.heur_w_corner;
+                let heur_w_edge = args.heur_w_edge;
+                let heur_w_center = args.heur_w_center;
+                let heur_w_greedy = args.heur_w_greedy;
+                let heur_w_defense = args.heur_w_defense;
+                let heur_w_element = args.heur_w_element;
+
                 let handle = std::thread::spawn(move || {
                     // Allocate a per-worker FixedTT and keep it warm across all games
                     let budget_bytes = tt_mib.saturating_mul(1024 * 1024);
@@ -761,6 +1617,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             };
     
                             let mut state = GameState::with_hands(rules, hand_a, hand_b, cell_elements);
+
+                            // New: per-game heuristic weights snapshot
+                            let heur_weights = HeurWeights {
+                                corner: heur_w_corner,
+                                edge: heur_w_edge,
+                                center: heur_w_center,
+                                greedy: heur_w_greedy,
+                                defense: heur_w_defense,
+                                element: heur_w_element,
+                            };
     
                             // Per-game off-PV activation
                             let off_pv_game = matches!(off_pv_strategy, OffPvStrategyOpt::Random | OffPvStrategyOpt::Weighted | OffPvStrategyOpt::Mcts)
@@ -839,28 +1705,81 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 let line = serde_json::to_string(&rec).expect("serialize JSONL record");
                                 lines.push(line);
     
-                                // Choose next move based on off-PV setting
-                                let next_mv = if off_pv_game {
-                                    match off_pv_strategy {
-                                        OffPvStrategyOpt::Random => {
-                                            pick_random_non_pv_move(&state, bm, base_seed, i as u64, state.board.filled_count())
+                                // Choose next move based on play strategy (mix overrides off-PV)
+                                let next_mv = match play_strategy {
+                                    PlayStrategyOpt::Mix => {
+                                        // Use MCTS distribution only when policy_format is Mcts
+                                        let dist_opt = if matches!(policy_format, PolicyFormatOpt::Mcts) {
+                                            mcts_root_dist.as_ref()
+                                        } else {
+                                            None
+                                        };
+                                        choose_next_move_mixed(
+                                            &state,
+                                            &cards_c,
+                                            bm,
+                                            dist_opt,
+                                            base_seed,
+                                            i as u64,
+                                            state.board.filled_count(),
+                                            mix_heuristic_early,
+                                            mix_heuristic_late,
+                                            mix_mcts,
+                                            &heur_weights,
+                                            matches!(policy_format, PolicyFormatOpt::Mcts),
+                                        )
+                                    }
+                                    PlayStrategyOpt::Pv => {
+                                        // Preserve off-PV behavior when not mixing
+                                        if off_pv_game {
+                                            match off_pv_strategy {
+                                                OffPvStrategyOpt::Random => {
+                                                    pick_random_non_pv_move(&state, bm, base_seed, i as u64, state.board.filled_count())
+                                                }
+                                                OffPvStrategyOpt::Weighted => {
+                                                    pick_weighted_non_pv_move(&child_vals, bm, base_seed, i as u64, state.board.filled_count())
+                                                }
+                                                OffPvStrategyOpt::Mcts => {
+                                                    if matches!(policy_format, PolicyFormatOpt::Mcts) {
+                                                        let dist_ref = mcts_root_dist.as_ref().expect("mcts_root_dist present");
+                                                        pick_mcts_non_pv_move_from_dist(dist_ref, bm, base_seed, i as u64, state.board.filled_count())
+                                                    } else {
+                                                        let seed_for_mcts_step = splitmix64(&mut rng_state);
+                                                        let dist2 = mcts_policy_distribution(&state, &cards_c, mcts_rollouts, seed_for_mcts_step);
+                                                        pick_mcts_non_pv_move_from_dist(&dist2, bm, base_seed, i as u64, state.board.filled_count())
+                                                    }
+                                                }
+                                            }
+                                        } else {
+                                            bm
                                         }
-                                        OffPvStrategyOpt::Weighted => {
-                                            pick_weighted_non_pv_move(&child_vals, bm, base_seed, i as u64, state.board.filled_count())
-                                        }
-                                        OffPvStrategyOpt::Mcts => {
-                                            if matches!(policy_format, PolicyFormatOpt::Mcts) {
-                                                let dist_ref = mcts_root_dist.as_ref().expect("mcts_root_dist present");
-                                                pick_mcts_non_pv_move_from_dist(dist_ref, bm, base_seed, i as u64, state.board.filled_count())
+                                    }
+                                    PlayStrategyOpt::Mcts => {
+                                        if matches!(policy_format, PolicyFormatOpt::Mcts) {
+                                            match mcts_root_dist.as_ref() {
+                                                Some(dist) => choose_next_move_mcts(&state, dist, base_seed, i as u64, state.board.filled_count()),
+                                                None => bm,
+                                            }
+                                        } else {
+                                            // No MCTS policy available; fall back to PV/off-PV behavior as-is
+                                            if off_pv_game {
+                                                match off_pv_strategy {
+                                                    OffPvStrategyOpt::Random => {
+                                                        pick_random_non_pv_move(&state, bm, base_seed, i as u64, state.board.filled_count())
+                                                    }
+                                                    OffPvStrategyOpt::Weighted => {
+                                                        pick_weighted_non_pv_move(&child_vals, bm, base_seed, i as u64, state.board.filled_count())
+                                                    }
+                                                    OffPvStrategyOpt::Mcts => bm,
+                                                }
                                             } else {
-                                                let seed_for_mcts_step = splitmix64(&mut rng_state);
-                                                let dist2 = mcts_policy_distribution(&state, &cards_c, mcts_rollouts, seed_for_mcts_step);
-                                                pick_mcts_non_pv_move_from_dist(&dist2, bm, base_seed, i as u64, state.board.filled_count())
+                                                bm
                                             }
                                         }
                                     }
-                                } else {
-                                    bm
+                                    PlayStrategyOpt::Heuristic => {
+                                        choose_next_move_heuristic(&state, &cards_c, &heur_weights, base_seed, i as u64, state.board.filled_count())
+                                    }
                                 };
     
                                 if let Some(mv) = next_mv {

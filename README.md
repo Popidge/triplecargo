@@ -132,6 +132,41 @@ Determinism specifics
   - Enumeration is deterministic. For optional MCTS policy distributions in full mode, rollout RNG derives from (seed XOR state_zobrist) to preserve traversal-order invariance.
 - With identical seeds and flags, the exported JSONL is byte-for-byte identical.
 
+🧪 Single-state evaluation (stdin → stdout)
+
+Evaluate a single game state JSON via the precompute binary. Reads exactly one JSON object from stdin and writes exactly one JSON object to stdout. Deterministic: same input → identical output (including PV order).
+
+Input schema (subset of export JSONL line, trajectory mode):
+{
+  "board": [ { "cell":0,"card_id":12,"owner":"A","element":"F" }, ... ],
+  "hands": { "A":[34,56,78,90,11], "B":[22,33,44,55,66] },
+  "to_move": "A",
+  "turn": 0,
+  "rules": { "elemental":true,"same":true,"plus":false,"same_wall":false },
+  "board_elements": ["F","I",null,...]   // optional; if present, must match board[].element
+  // Optional fields ignored if present:
+  // game_id, state_idx, policy_target, value_target, state_hash
+}
+
+Output schema (stdout):
+{
+  "best_move": { "card_id": 34, "cell": 0 },  // omitted at terminal (no null)
+  "value": 1,                                  // {-1,0,1} from side-to-move perspective
+  "margin": 3,                                 // A_cards − B_cards at terminal
+  "pv": [ { "card_id":34,"cell":0 }, { "card_id":22,"cell":4 }, ... ],
+  "nodes": 123456,
+  "depth": 9,
+  "state_hash": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4"
+}
+
+Example:
+echo '{"board":[{"cell":0,"card_id":null,"owner":null},{"cell":1,"card_id":null,"owner":null},{"cell":2,"card_id":null,"owner":null},{"cell":3,"card_id":null,"owner":null},{"cell":4,"card_id":null,"owner":null},{"cell":5,"card_id":null,"owner":null},{"cell":6,"card_id":null,"owner":null},{"cell":7,"card_id":null,"owner":null},{"cell":8,"card_id":null,"owner":null}],"hands":{"A":[1,2,3,4,5],"B":[6,7,8,9,10]},"to_move":"A","turn":0,"rules":{"elemental":false,"same":false,"plus":false,"same_wall":false}}' | target/release/precompute --eval-state
+
+Notes:
+- In eval mode, progress bars and other logs are suppressed; only the JSON line is printed to stdout.
+- Use --verbose to print a single diagnostic line like “[eval] nodes=..., depth=...” to stderr.
+- Configure TT size with --tt-bytes N (MiB) to control memory usage.
+- Implementation entry: see precompute binary eval branch in [src/bin/precompute.rs](src/bin/precompute.rs:555).
 CLI examples
 - Trajectory export (onehot), 10 games, no elements:
   - target/release/precompute --export export.jsonl --export-mode trajectory --games 10 --seed 42 --hand-strategy random --rules none --elements none --policy-format onehot --value-mode winloss
@@ -141,6 +176,8 @@ CLI examples
   - target/release/precompute --export export_weighted.jsonl --export-mode trajectory --games 100 --seed 123 --hand-strategy random --rules none --elements none --policy-format onehot --off-pv-rate 0.2 --off-pv-strategy weighted
 - Trajectory export with off-PV mcts stepping, reusing policy distribution:
   - target/release/precompute --export export_mcts_offpv.jsonl --export-mode trajectory --games 100 --seed 123 --hand-strategy stratified --rules elemental,same --elements random --policy-format mcts --mcts-rollouts 128 --off-pv-rate 0.2 --off-pv-strategy mcts
+- Trajectory export with progressive heuristic mix (default play-strategy=mix):
+  - target/release/precompute --export export_mix.jsonl --export-mode trajectory --games 50 --seed 7 --hand-strategy random --rules none --elements none --policy-format onehot --play-strategy mix --mix-heuristic-early 0.65 --mix-heuristic-late 0.10
 - Full state‑space export (exhaustive) for one sampled hand pair:
   - target/release/precompute --export export_full.jsonl --export-mode full --seed 42 --hand-strategy random --rules none --elements none --policy-format onehot --value-mode winloss
 
@@ -219,6 +256,30 @@ Off-PV stepping (trajectory mode)
     - If --policy-format mcts, reuse the root MCTS distribution computed for policy_target; otherwise compute a fresh root MCTS with --mcts-rollouts (deterministic per-ply seed).
     - Set PV probability to 0, renormalise, sample deterministically.
     - Fallback: if the PV move had all probability mass (sum of non-PV probs == 0), select the highest-probability non-PV move deterministically.
+
+Play strategy and heuristic mixing (trajectory mode)
+- New play selector, configured via --play-strategy pv|mcts|heuristic|mix (default: mix).
+  - pv: always play the principal-variation move.
+  - mcts: sample from the MCTS root distribution when --policy-format mcts; otherwise falls back to pv/off-pv.
+  - heuristic: sample from a lightweight heuristic distribution (see weights below).
+  - mix: per-ply mixture of PV, Heuristic, and optional MCTS; early plies are heuristic‑heavier and late plies PV‑heavier.
+- Progressive schedule flags:
+  - --mix-heuristic-early FLOAT (default 0.65)
+  - --mix-heuristic-late FLOAT (default 0.10)
+  - --mix-mcts FLOAT (default 0.25 when --policy-format mcts, otherwise ignored)
+- Heuristic feature weights (configurable):
+  - --heur-w-corner (default 1.0), --heur-w-edge (0.3), --heur-w-center (-0.2)
+  - --heur-w-greedy (0.8): immediate margin gain from the mover’s perspective after simulating the move using apply_move in [src/engine/apply.rs](src/engine/apply.rs:224)
+  - --heur-w-defense (0.6): exposure/vulnerability vs neighbours using adjusted sides like in [adjusted_sides_for_cell](src/engine/apply.rs:33)
+  - --heur-w-element (0.6): element synergy penalties/bonuses based on Board::cell_element in [src/board.rs](src/board.rs:56)
+- Determinism: sampling uses rng_for_state(seed, game_id, turn) in [src/rng.rs](src/rng.rs:12). The policy/value labels still come from perfect play using [search_root_with_children()](src/solver/negamax.rs:98); mixing affects only which move advances the trajectory.
+- Interplay with off-PV:
+  - When --play-strategy=mix, off-PV flags are ignored (mix governs diversity deterministically).
+  - For --play-strategy=pv|mcts|heuristic, existing --off-pv-rate/--off-pv-strategy behaviour is preserved.
+- Implementation entry points:
+  - Mixed selector logic: choose_next_move_mixed in [src/bin/precompute.rs](src/bin/precompute.rs:877)
+  - MCTS policy distribution: mcts_policy_distribution in [src/bin/precompute.rs](src/bin/precompute.rs:381)
+  - Root Q-values for policy/labels: search_root_with_children in [src/solver/negamax.rs](src/solver/negamax.rs:98)
 
 Value targets
 - --value-mode winloss:
