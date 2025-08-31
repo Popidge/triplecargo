@@ -1,376 +1,350 @@
-♠️ Triplecargo — Triple Triad Assistant & Solver (FF8)
+# ♠️ Triplecargo — Triple Triad Assistant & Solver (FF8)
 
-Deterministic, high‑performance Rust implementation of the Final Fantasy VIII Triple Triad ruleset, designed to support:
+Deterministic, high-performance Rust implementation of Final Fantasy VIII's Triple Triad ruleset. Designed for exact solving, large-scale precomputation, analysis experiments, training-data export, and AI/ML integration.
 
-- Perfect play solving (Negamax + αβ + TT).
-- Full state‑space precomputation for instant queries.
-- Analysis experiments (first‑player advantage, card ratings, rule impacts).
-- AI/ML integration for lightweight move suggestion and imperfect‑information play.
-Triplecargo is both a research‑grade solver and the foundation for a superhuman Triple Triad assistant — combining exact computation with modern AI techniques.
-
----
-✨ Features
-
-- Full ruleset: Basic, Elemental, Same, Plus, Same Wall, Combo cascades.
-- Deterministic engine: fixed move ordering, reproducible cascades, stable hashing.
-- High‑performance solver: Negamax + αβ pruning + transposition table.
-- Precompute driver: bulk solve all reachable states for a given hand/ruleset.
-- Persistence: append‑only batch writes, deterministic compaction, optional compression, checkpoint/resume.
-- Analysis mode: RAM‑only runs for experiments (no I/O bottleneck).
-- Throughput: ~10M nodes/sec, ~1M states/sec on a Ryzen 3600.
-- Training data export (JSONL): trajectory or full state‑space, policy_format onehot|mcts, deterministic with fixed seed.
+Key capabilities:
+- Perfect-play solving (Negamax + αβ + transposition table).
+- Full state-space precomputation for instant queries.
+- Deterministic, reproducible exports for training and analysis.
+- Lightweight assistants and integration points for ML workflows.
 
 ---
-📂 Project layout
 
-- Core engine: rules, state, hashing, scoring.
-- Solver: negamax + αβ + TT, PV reconstruction.
-- Precompute: state enumeration, parallel solve, persistence.
-- Persistence: batch writes, compression, checkpointing.
-- Binaries:
-	- tt-cli: demo CLI.
-	- precompute: bulk solver + DB writer.
-- Tests: engine correctness, rule edge cases, solver determinism.
+## Quickstart
 
----
-🧮 Data model
+1. Build (release):
+   - cargo build --release
 
-- Cards: loaded from data/cards.json, validated for ranges and uniqueness.
-- Board: 3×3 fixed array, optional per‑cell element.
-- Hands: 5 cards per player (engine: fixed arrays; export: shrinking lists as cards are played).
-- Rules: independent toggles for Elemental, Same, Plus, Same Wall.
-- Hashing: XOR‑based Zobrist, incremental updates, 128‑bit keys.
+2. Binaries
+   - Precompute / export: [`target/release/precompute`](target/release/precompute:1)
+   - Query / lookup: [`target/release/query`](target/release/query:1)
+   - Demo CLI: [`target/release/tt-cli`](target/release/tt-cli:1)
+
+3. Card data
+   - Card definitions are loaded from [`data/cards.json`](data/cards.json:1).
 
 ---
-📤 Training data export (JSONL)
 
-Overview
-- Export solver-labelled states to JSONL for training and analysis.
-- Two export modes:
-  - --export-mode trajectory (default): emits a single 9-state principal-variation trajectory per sampled game.
-  - --export-mode full: emits the entire reachable state space for one sampled hand pair (exhaustive).
-- Deterministic by design: same seed+flags → identical output (including elements layout, off-PV behaviour, and policy/value targets).
+## Overview & Design Goals
 
-Core flags
-- Output and mode
-  - --export PATH                JSONL output file
-  - --export-mode trajectory|full
-  - --games N                    number of games (trajectory mode only; full mode ignores this)
-- Parallelism and scheduling
-  - --threads N                  number of worker threads (default: available_parallelism()-1, min 1)
-  - --chunk-size N               number of games each worker fetches at once; if omitted, defaults to min(32, max(1, floor(games/threads))); affects scheduling only
-- Sampling and determinism
-  - --seed U64                   master seed; controls hand sampling, per-ply RNG (off-PV), and MCTS rollouts
-  - --hand-strategy random|stratified
-  - --rules elemental,same,plus,same_wall (or 'none')
-  - --elements none|random       element layout (random is deterministic per game)
-- Policy and value targets
-  - --policy-format onehot|mcts
-  - --mcts-rollouts N            rollouts used when --policy-format mcts (default 100)
-  - --value-mode winloss|margin
-- Off-PV stepping (trajectory mode only)
-  - --off-pv-rate FLOAT [0..1]   per-game probability of off-PV stepping (0 disables)
-  - --off-pv-strategy random|weighted|mcts
-    - random: uniform over legal non-PV moves; if no alternative, fall back to PV.
-    - weighted: softmax over root child negamax Q values; PV mass set to 0, renormalised, then sampled.
-    - mcts: reuse root MCTS distribution when policy_format=mcts; otherwise compute root MCTS with --mcts-rollouts and sample after zeroing PV.
+Triplecargo is both a research-grade solver and the foundation for a superhuman Triple Triad assistant — combining exact computation with modern AI techniques. Design priorities:
 
-- Transposition table (per worker)
-  - --tt-bytes N               TT size per worker in MiB (default 32). Capacity is rounded down to the nearest power-of-two entries that fit under the requested budget. Applies to both trajectory and full export modes. Total memory usage ≈ workers × tt-bytes.
-Parallel export (worker + writer) — TASK T7
-- The export pipeline now supports an explicit worker + writer model (replacing the previous Rayon pool).
-- New CLI flag: --threads N (default: available_parallelism()-1). Workers claim game indices via an atomic counter and operate deterministically.
-- Worker behavior:
-  - Deterministically sample hands/elements from the master seed and game id.
-  - For each game produce 9 JSONL lines by running full-depth solver searches (using search_root_with_children() for policy Q values).
-  - Send (game_id, Vec<String>) to the single writer thread.
-- Writer behavior:
-  - Single dedicated writer receives per-game line blocks, buffers out-of-order arrivals, and writes games in strict increasing game_id order to maintain byte-for-byte determinism across different thread counts.
-- Determinism guarantees:
-  - With identical seed + flags the JSONL output is byte-for-byte identical whether --threads=1 or --threads>1.
-  - Tests: --games 10 produces 90 lines; output compared equal across thread counts.
-- Progress:
-  - The trajectory export includes an indicatif ProgressBar with a background updater that reports states/sec, nodes/sec, ETA, and policy info.
+- Correctness and determinism (fixed move ordering, reproducible cascades, stable hashing).
+- High throughput for precomputation (multi-threaded, per-worker caches).
+- Clean, append-only persistence for database writes and deterministic compaction.
+- Export formats suitable for ML training (JSONL trajectory or full state space).
 
-Chunked scheduling — TASK T9
-- New CLI flag: --chunk-size N (dynamic default).
-- Default behaviour when --chunk-size is omitted:
-  - effective_chunk_size = min(32, max(1, floor(games/threads))).
-  - This keeps small runs snappy (smaller chunks) while avoiding excessive overhead on large runs (cap at 32).
-- Scheduling model:
-  - Each worker requests N games at a time (a "chunk") from a deterministic round‑robin dispatcher.
-  - Mapping is round‑based: in round r, worker w processes chunk index (r * workers + w).
-  - For a chunk index k, the assigned game_id range is [k*N, min((k+1)*N, games)).
-  - Workers solve games in their chunk sequentially, then proceed to their next round’s chunk.
-- Determinism:
-  - Assignment is a pure function of (worker_id, worker_count, chunk_size), not timing.
-  - The single writer preserves strict increasing game_id order, so JSONL output is byte‑for‑byte identical for the same seed + flags regardless of --chunk-size and --threads.
-  - game_id stability is preserved across different chunk sizes and thread counts.
-- Logging:
-  - At startup, export logs include the configured chunk size:
-    [export] chunk_size=N
-- Trade‑offs:
-  - Larger chunks reduce scheduling overhead and improve locality for per‑worker TT warming.
-  - Smaller chunks can improve tail latency and load balance for heterogeneous workloads.
-  - Chunking affects scheduling only; output content and ordering are unchanged.
+---
 
-Per-worker transposition table — TASK T8
-- Each worker owns a fixed-size, direct-mapped transposition table (no sharing; no locks).
-- Default budget is 32 MiB per worker; configurable via --tt-bytes N (MiB).
-- Warming: in trajectory mode, a worker keeps its TT alive across all games it processes to maximise reuse.
-- Full mode uses a single TT of the same budget for the entire DFS export.
-- Rounding rule: the requested budget is rounded down to the largest power-of-two capacity that fits. Effective bytes are approximately capacity × entry_size.
-- Memory formula: total TT memory ≈ workers × tt-bytes.
-- Determinism: with identical seed + flags, output is byte-for-byte identical regardless of --tt-bytes (TT size does not influence labels).
-- Startup logs (one line per worker) show the chosen capacity, e.g.:
-  [worker 0] TT target=32 MiB capacity=8388608 entries ≈31.9 MiB
-Determinism specifics
-- Trajectory mode:
-  - Labels (policy/value) are computed from full-depth perfect play at each ply; labels remain PV-optimal regardless of stepping strategy.
-  - Off-PV stepping uses a per-ply RNG derived from (seed, game_id, turn) for deterministic sampling.
-- Full mode:
-  - Enumeration is deterministic. For optional MCTS policy distributions in full mode, rollout RNG derives from (seed XOR state_zobrist) to preserve traversal-order invariance.
-- With identical seeds and flags, the exported JSONL is byte-for-byte identical.
+## Binaries and Modes
 
-🧪 Single-state evaluation (stdin → stdout)
+- Precompute/export: [`target/release/precompute`](target/release/precompute:1)
+  - Exports JSONL training data (trajectory or full state-space).
+  - Single-state evaluation mode: see the "Single-state evaluation" section and [`src/bin/precompute.rs:555`](src/bin/precompute.rs:555).
 
-Evaluate a single game state JSON via the precompute binary. Reads exactly one JSON object from stdin and writes exactly one JSON object to stdout. Deterministic: same input → identical output (including PV order).
+- Query service: [`target/release/query`](target/release/query:1)
+  - Planned CLI/HTTP lookup against precomputed DBs.
 
-Input schema (subset of export JSONL line, trajectory mode):
+- Demo CLI: [`target/release/tt-cli`](target/release/tt-cli:1)
+
+Source entry points:
+- Precompute implementation and play/selector logic: [`src/bin/precompute.rs:381`](src/bin/precompute.rs:381), [`src/bin/precompute.rs:877`](src/bin/precompute.rs:877).
+- Root search + child Q values: [`src/solver/negamax.rs:98`](src/solver/negamax.rs:98).
+- Heuristic simulation helpers: [`src/engine/apply.rs:224`](src/engine/apply.rs:224), [`src/engine/apply.rs:33`](src/engine/apply.rs:33).
+- Board cell elements: [`src/board.rs:56`](src/board.rs:56).
+
+---
+
+## CLI Reference — Export / Precompute
+
+The following documents the flags accepted by the precompute/export binary (`[`target/release/precompute`](target/release/precompute:1)`). Flags are grouped by purpose and described with defaults and semantics.
+
+Top-level export
+- --export PATH
+  - JSONL output file path (required for export runs).
+- --export-mode trajectory|full
+  - trajectory (default): emit a single 9-state PV trajectory per sampled game.
+  - full: emit the entire reachable state space for one sampled hand pair (exhaustive).
+- --games N
+  - Number of sampled games (trajectory mode only; ignored in full mode).
+
+Parallelism & scheduling
+- --threads N
+  - Number of worker threads (default: available_parallelism()-1, min 1). Workers + single writer model; deterministically claim game indices.
+- --chunk-size N
+  - Number of games each worker fetches at once. If omitted, defaults to effective_chunk_size = min(32, max(1, floor(games/threads))). Scheduling only; affects locality and latency.
+
+Sampling & determinism
+- --seed U64
+  - Master RNG seed used for hand sampling, per-ply RNG (off-PV), and MCTS rollouts. Deterministic across runs with identical flags.
+- --hand-strategy random|stratified
+  - How hands are sampled from the card pool.
+- --rules elemental,same,plus,same_wall (or 'none')
+  - Comma-separated rule toggles. Example: --rules elemental,same
+- --elements none|random
+  - Board element layout. random is deterministic per game (driven by --seed).
+
+Policy & value targets
+- --policy-format onehot|mcts
+  - onehot: single-best-move export (object).
+  - mcts: distribution over legal moves (map).
+- --mcts-rollouts N
+  - Rollouts used when --policy-format mcts (default 100).
+- --value-mode winloss|margin
+  - winloss: {-1,0,1} from side-to-move perspective.
+  - margin: integer final score difference (A_cards − B_cards) from A's perspective.
+
+Off-principal-variation (off-PV) stepping (trajectory-only)
+- --off-pv-rate FLOAT
+  - Per-game probability (0..1) that a game uses off-PV stepping for all plies. 0 disables.
+- --off-pv-strategy random|weighted|mcts
+  - random: uniform over legal non-PV moves (fallback to PV when none).
+  - weighted: softmax over root child negamax Q values; PV mass zeroed and renormalised.
+  - mcts: reuse root MCTS (when --policy-format=mcts) or compute root MCTS with --mcts-rollouts otherwise.
+
+Transposition table configuration
+- --tt-bytes N
+  - TT size per worker in MiB (default 32). Rounded down to nearest power-of-two capacity that fits the budget. Total TT memory ≈ workers × tt-bytes.
+  - Use to control memory footprint for large parallel runs.
+
+Logging & verbosity
+- --verbose
+  - Emit a compact diagnostic line during eval-style runs and additional worker-start logs.
+
+Play strategy & heuristic mixing (trajectory)
+- --play-strategy pv|mcts|heuristic|mix (default: mix)
+  - pv: always play the principal-variation move.
+  - mcts: sample from MCTS root distribution when available.
+  - heuristic: sample from a lightweight heuristic distribution.
+  - mix: per-ply mixture of PV, heuristic, and optional MCTS; early plies are heuristic-heavier, late plies PV-heavier.
+- --mix-heuristic-early FLOAT (default 0.65)
+- --mix-heuristic-late FLOAT (default 0.10)
+- --mix-mcts FLOAT (default 0.25 when --policy-format mcts, else ignored)
+
+Heuristic feature weights
+- --heur-w-corner FLOAT (default 1.0)
+- --heur-w-edge FLOAT (default 0.3)
+- --heur-w-center FLOAT (default -0.2)
+- --heur-w-greedy FLOAT (default 0.8)
+  - Immediate margin gain after simulating the move (helper in [`src/engine/apply.rs:224`](src/engine/apply.rs:224)).
+- --heur-w-defense FLOAT (default 0.6)
+  - Exposure/vulnerability vs neighbours (uses adjusted sides logic in [`src/engine/apply.rs:33`](src/engine/apply.rs:33)).
+- --heur-w-element FLOAT (default 0.6)
+  - Element synergy penalties/bonuses (see [`src/board.rs:56`](src/board.rs:56)).
+
+Progress & determinism notes
+- The writer thread buffers out-of-order arrivals and writes games in strict increasing game_id order to guarantee byte-for-byte identical JSONL output across different --threads and --chunk-size values when the seed + flags are identical.
+- Worker behavior and scheduling are deterministic functions of (seed, game_id, worker_id, chunk_size).
+
+Single-state evaluation
+- Mode: read exactly one JSON object from stdin and write exactly one JSON object to stdout.
+- Invoke: [`target/release/precompute --eval-state`](target/release/precompute:1) (suppress progress; use --verbose for diagnostics).
+- Configure TT size with --tt-bytes to control memory during eval.
+
+Input schema (single-state eval — subset of a JSONL line)
 {
   "board": [ { "cell":0,"card_id":12,"owner":"A","element":"F" }, ... ],
   "hands": { "A":[34,56,78,90,11], "B":[22,33,44,55,66] },
   "to_move": "A",
   "turn": 0,
   "rules": { "elemental":true,"same":true,"plus":false,"same_wall":false },
-  "board_elements": ["F","I",null,...]   // optional; if present, must match board[].element
-  // Optional fields ignored if present:
-  // game_id, state_idx, policy_target, value_target, state_hash
+  "board_elements": ["F","I",null,...]   // optional; if present must match board[].element
 }
 
-Output schema (stdout):
+Output schema (single-state eval)
 {
-  "best_move": { "card_id": 34, "cell": 0 },  // omitted at terminal (no null)
+  "best_move": { "card_id": 34, "cell": 0 },  // omitted at terminal
   "value": 1,                                  // {-1,0,1} from side-to-move perspective
   "margin": 3,                                 // A_cards − B_cards at terminal
-  "pv": [ { "card_id":34,"cell":0 }, { "card_id":22,"cell":4 }, ... ],
+  "pv": [ { "card_id":34,"cell":0 }, ... ],
   "nodes": 123456,
   "depth": 9,
   "state_hash": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4"
 }
+- See the eval-mode entry in source: [`src/bin/precompute.rs:555`](src/bin/precompute.rs:555).
 
-Example:
-echo '{"board":[{"cell":0,"card_id":null,"owner":null},{"cell":1,"card_id":null,"owner":null},{"cell":2,"card_id":null,"owner":null},{"cell":3,"card_id":null,"owner":null},{"cell":4,"card_id":null,"owner":null},{"cell":5,"card_id":null,"owner":null},{"cell":6,"card_id":null,"owner":null},{"cell":7,"card_id":null,"owner":null},{"cell":8,"card_id":null,"owner":null}],"hands":{"A":[1,2,3,4,5],"B":[6,7,8,9,10]},"to_move":"A","turn":0,"rules":{"elemental":false,"same":false,"plus":false,"same_wall":false}}' | target/release/precompute --eval-state
+---
 
-Notes:
-- In eval mode, progress bars and other logs are suppressed; only the JSON line is printed to stdout.
-- Use --verbose to print a single diagnostic line like “[eval] nodes=..., depth=...” to stderr.
-- Configure TT size with --tt-bytes N (MiB) to control memory usage.
-- Implementation entry: see precompute binary eval branch in [src/bin/precompute.rs](src/bin/precompute.rs:555).
-CLI examples
-- Trajectory export (onehot), 10 games, no elements:
-  - target/release/precompute --export export.jsonl --export-mode trajectory --games 10 --seed 42 --hand-strategy random --rules none --elements none --policy-format onehot --value-mode winloss
-- Trajectory export (MCTS policy, 256 rollouts), stratified hands, Elemental+Same, margin values:
-  - target/release/precompute --export export_mcts.jsonl --export-mode trajectory --games 10 --seed 42 --hand-strategy stratified --rules elemental,same --elements random --policy-format mcts --mcts-rollouts 256 --value-mode margin
-- Trajectory export with off-PV weighted stepping @ 20% games:
-  - target/release/precompute --export export_weighted.jsonl --export-mode trajectory --games 100 --seed 123 --hand-strategy random --rules none --elements none --policy-format onehot --off-pv-rate 0.2 --off-pv-strategy weighted
-- Trajectory export with off-PV mcts stepping, reusing policy distribution:
-  - target/release/precompute --export export_mcts_offpv.jsonl --export-mode trajectory --games 100 --seed 123 --hand-strategy stratified --rules elemental,same --elements random --policy-format mcts --mcts-rollouts 128 --off-pv-rate 0.2 --off-pv-strategy mcts
-- Trajectory export with progressive heuristic mix (default play-strategy=mix):
-  - target/release/precompute --export export_mix.jsonl --export-mode trajectory --games 50 --seed 7 --hand-strategy random --rules none --elements none --policy-format onehot --play-strategy mix --mix-heuristic-early 0.65 --mix-heuristic-late 0.10
-- Full state‑space export (exhaustive) for one sampled hand pair:
-  - target/release/precompute --export export_full.jsonl --export-mode full --seed 42 --hand-strategy random --rules none --elements none --policy-format onehot --value-mode winloss
+## JSONL Export Schema (per-line)
 
-JSONL schema
-Each line contains one state emitted before a move is taken.
+Each exported line represents the state before a move is taken.
 
+Core fields
+- game_id: sequential per sampled game (trajectory); 0 in full mode.
+- state_idx: 0..8 within a trajectory (equals "turn").
+- board: list of 9 cell objects:
+  - {"cell":0,"card_id":12,"owner":"A","element":"F"} — element present only when rules.elemental=true.
+- hands: "A" and "B" lists (shrinking across the trajectory).
+- to_move: "A" or "B"
+- turn: integer 0..8
+- rules: object with booleans (elemental, same, plus, same_wall)
+- policy_target:
+  - onehot → single best-move object: {"card_id":34,"cell":0}
+  - mcts → map of "cardId-cell" → probability: {"34-0":0.7,"56-1":0.3}
+  - Terminal states: onehot → omitted, mcts → {}
+- value_target:
+  - winloss: {-1,0,+1} (side-to-move perspective)
+  - margin: integer final score difference (A − B)
+- off_pv: boolean, true for exported lines belonging to off-PV games
+- state_hash: 128-bit Zobrist hash (hex string)
+
+Example JSONL line structure:
 {
-  "game_id": 12,                // sequential per sampled game (trajectory); 0 in full mode
-  "state_idx": 0,               // 0..8 within a trajectory (equals "turn")
-  "board": [
-    {"cell":0,"card_id":12,"owner":"A","element":"F"}, // element present only when rules.elemental=true; otherwise omitted
-    {"cell":1,"card_id":null,"owner":null,"element":null},
-    {"cell":2,"card_id":null,"owner":null,"element":"W"}
-  ],
-  "hands": {
-    "A": [34,56,78,90,11],      // shrinking lists (5 → 0 across a trajectory)
-    "B": [22,33,44,55,66]
-  },
+  "game_id": 12,
+  "state_idx": 0,
+  "board": [...],
+  "hands": { "A": [...], "B": [...] },
   "to_move": "A",
   "turn": 0,
-  "rules": {
-    "elemental": true,
-    "same": true,
-    "plus": false,
-    "same_wall": false
-  },
-
-  // Policy target semantics:
-  // onehot → single best move object:
-  //   "policy_target": {"card_id":34,"cell":0}
-  // mcts → distribution over legal moves:
-  //   "policy_target": {"34-0":0.7,"56-1":0.3}
+  "rules": { "elemental": true, "same": true, "plus": false, "same_wall": false },
   "policy_target": {"34-0": 0.7, "56-1": 0.3},
-
-  // Value target semantics controlled by --value-mode:
-  // - winloss → {-1,0,+1} from side-to-move perspective (sign of solver value)
-  // - margin  → integer margin A_cards − B_cards (A-perspective)
   "value_target": 1,
   "value_mode": "winloss",
-
-  // Off-principal-variation sampling flag; true for all lines of off-PV games, false otherwise
   "off_pv": false,
-
-  // 128-bit Zobrist hash of the state (hex string)
-  "state_hash": "a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4"
+  "state_hash": "..."
 }
 
-Export semantics
+---
 
-State timing
-- Each JSONL line represents the state before a move is made.
-- At turn = t, the board has t occupied cells; the side in to_move will play their (t+1)-th card next.
-- Hands shrink accordingly; at the final turn = 8 there is still one card left (and a policy_target showing where it will be placed).
+## Export Semantics & Scheduling
 
-Policy targets
-- --policy-format onehot:
-  - Exported as a single best-move object:
-    "policy_target": {"card_id": 34, "cell": 0}
-- --policy-format mcts:
-  - Exported as a {"cardId-cell": prob} map over legal moves:
-    "policy_target": {"34-0": 0.7, "56-1": 0.3}
-- Terminal states:
-  - onehot → policy_target omitted (null).
-  - mcts → empty map {}.
+Chunked scheduling
+- Each worker acquires chunks of game indices deterministically: a round‑robin mapping of (worker_id, worker_count, chunk_size) to game ranges.
+- Default chunk-size behavior: effective_chunk_size = min(32, max(1, floor(games/threads))).
+- Chunking affects only scheduling and locality; it does not change exported content or ordering because the single writer emits lines in increasing game_id order.
 
-Off-PV stepping (trajectory mode)
-- Labels remain PV-optimal: policy/value targets reflect perfect play; stepping only affects which move is played next to advance the trajectory.
-- Per-game activation: with probability --off-pv-rate a game uses off-PV stepping for all its plies.
-- Strategies:
-  - random:
-    - Uniform over legal non-PV moves. If no alternative exists, fall back to the PV move (or None at terminal).
-  - weighted:
-    - Use root child negamax values (Q). Compute softmax(Q), set PV move probability to 0, renormalise, sample with a deterministic RNG derived from (seed, game_id, turn).
-    - If no alternative exists, fall back to PV.
-  - mcts:
-    - If --policy-format mcts, reuse the root MCTS distribution computed for policy_target; otherwise compute a fresh root MCTS with --mcts-rollouts (deterministic per-ply seed).
-    - Set PV probability to 0, renormalise, sample deterministically.
-    - Fallback: if the PV move had all probability mass (sum of non-PV probs == 0), select the highest-probability non-PV move deterministically.
+Per-worker transposition table (TT)
+- Each worker owns a fixed-size direct-mapped TT (no sharing or locks).
+- Defaults:
+  - --tt-bytes 32 (MiB) per worker (rounded down to power-of-two capacity).
+- Warming:
+  - In trajectory mode, each worker reuses its TT across the games it processes for improved locality.
+  - In full mode, a single TT is used for the entire DFS export.
+- Determinism:
+  - With identical seed + flags, labels are byte-for-byte identical regardless of --tt-bytes or --threads.
 
-Play strategy and heuristic mixing (trajectory mode)
-- New play selector, configured via --play-strategy pv|mcts|heuristic|mix (default: mix).
-  - pv: always play the principal-variation move.
-  - mcts: sample from the MCTS root distribution when --policy-format mcts; otherwise falls back to pv/off-pv.
-  - heuristic: sample from a lightweight heuristic distribution (see weights below).
-  - mix: per-ply mixture of PV, Heuristic, and optional MCTS; early plies are heuristic‑heavier and late plies PV‑heavier.
-- Progressive schedule flags:
-  - --mix-heuristic-early FLOAT (default 0.65)
-  - --mix-heuristic-late FLOAT (default 0.10)
-  - --mix-mcts FLOAT (default 0.25 when --policy-format mcts, otherwise ignored)
-- Heuristic feature weights (configurable):
-  - --heur-w-corner (default 1.0), --heur-w-edge (0.3), --heur-w-center (-0.2)
-  - --heur-w-greedy (0.8): immediate margin gain from the mover’s perspective after simulating the move using apply_move in [src/engine/apply.rs](src/engine/apply.rs:224)
-  - --heur-w-defense (0.6): exposure/vulnerability vs neighbours using adjusted sides like in [adjusted_sides_for_cell](src/engine/apply.rs:33)
-  - --heur-w-element (0.6): element synergy penalties/bonuses based on Board::cell_element in [src/board.rs](src/board.rs:56)
-- Determinism: sampling uses rng_for_state(seed, game_id, turn) in [src/rng.rs](src/rng.rs:12). The policy/value labels still come from perfect play using [search_root_with_children()](src/solver/negamax.rs:98); mixing affects only which move advances the trajectory.
-- Interplay with off-PV:
-  - When --play-strategy=mix, off-PV flags are ignored (mix governs diversity deterministically).
-  - For --play-strategy=pv|mcts|heuristic, existing --off-pv-rate/--off-pv-strategy behaviour is preserved.
-- Implementation entry points:
-  - Mixed selector logic: choose_next_move_mixed in [src/bin/precompute.rs](src/bin/precompute.rs:877)
-  - MCTS policy distribution: mcts_policy_distribution in [src/bin/precompute.rs](src/bin/precompute.rs:381)
-  - Root Q-values for policy/labels: search_root_with_children in [src/solver/negamax.rs](src/solver/negamax.rs:98)
+Determinism guarantee
+- With identical seed and flags, JSONL output is byte-for-byte identical across runs regardless of thread count and chunk size. The writer enforces ordering and workers derive sampling deterministically.
 
-Value targets
-- --value-mode winloss:
-  - value ∈ {-1, 0, +1}, always from side-to-move perspective.
-    - +1 = side-to-move wins under perfect play
-    - 0  = draw
-    - −1 = side-to-move loses
-- --value-mode margin:
-  - integer final score difference (A_cards − B_cards), always from A’s perspective, independent of who is to move.
-- Values are computed by solving the full remaining depth at each ply, so they match final outcomes.
+---
 
-Elements
-- When rules.elemental = true, each board cell includes an "element" field with one of: F, I, T, W, E, P, H, L.
-- Otherwise the "element" field is omitted.
+## Play selection & Off-PV behaviour
 
-Metadata
-- game_id: sequential per sampled game (trajectory); 0 in full mode.
-- state_idx: 0..8 within a trajectory (equals turn).
-- off_pv: true for all lines of off-PV games; false otherwise.
-- state_hash: 128‑bit Zobrist hash of the state, hex string.
+Play strategies
+- --play-strategy pv|mcts|heuristic|mix
+  - mix (default): deterministic per-ply mixture (progressive schedule), described by --mix-heuristic-early/late and optionally --mix-mcts.
+- --mix-heuristic-early, --mix-heuristic-late
+  - Control the progressive probability schedule (defaults: 0.65 early, 0.10 late).
 
-🕹️ Rules implemented
+Off-PV stepping (trajectory only)
+- Controlled by --off-pv-rate and --off-pv-strategy.
+- Off-PV sampling is deterministic using an RNG derived from (seed, game_id, turn).
+
+Implementation references
+- Mixed selector logic: [`src/bin/precompute.rs:877`](src/bin/precompute.rs:877)
+- MCTS policy distribution: [`src/bin/precompute.rs:381`](src/bin/precompute.rs:381)
+- Root Q-values used for policy/value: [`src/solver/negamax.rs:98`](src/solver/negamax.rs:98)
+
+---
+
+## Rules Implemented
 
 - Basic capture: placed card flips weaker adjacent opponents.
 - Elemental: +1/−1 adjustments based on cell element.
 - Same: 2+ equalities trigger flips.
 - Same Wall: walls count as 10 for Same.
 - Plus: equal sums trigger flips.
-- Combo: cascades apply Basic rule only.
+- Combo: cascades that apply Basic rule only.
+
+References: rules engine and apply logic are implemented across [`src/rules.rs`](src/rules.rs:1), [`src/engine/apply.rs:224`](src/engine/apply.rs:224).
 
 ---
-⚡ Performance & determinism
 
-- Move ordering: Corners > Edges > Center, then cell index, then card id.
-- Cascade order: BFS queue, ascending indices.
-- TT: fixed‑size array, depth‑preferred replacement, full key verification.
-- Progress: MultiProgress bars, states/sec, nodes/sec.
-- Determinism: same state → same result, reproducible DBs.
+## Data model & Hashing
 
----
-🔮 Roadmap
-
-Near‑term
-
-- Query API: CLI/HTTP service for instant best‑move lookups from solved DBs.
-- Analysis experiments:
-	- First‑player advantage quantification.
-	- Card/hand Elo ratings.
-	- Elemental variance studies.
-	- Rule interaction balance.
-
-Mid‑term
-
-- AI/ML integration:
-	- NPZ export option for compact storage.
-	- PyTorch Dataset utilities to load JSONL → tensors.
-	- Train small policy/value nets for lightweight move suggestion.
-	- Reinforced self‑play (AlphaZero‑lite) to refine policies.
-- Imperfect‑info play:
-	- Expectimax/MCTS with hidden hands.
-	- Opponent modelling.
-
-Long‑term
-
-- Superhuman assistant:
-	- Instant move suggestions in Open and Closed formats.
-	- Configurable playstyles: Optimal, Robust, Exploitative.
-	- Human‑like play modes for fun.
-- Meta‑analysis:
-	- “Best hand” search for each ruleset.
-	- Card tier lists and balance insights.
-	- Quantitative impact of Elemental RNG.
+- Cards: validated, loaded from [`data/cards.json`](data/cards.json:1).
+- Board: fixed 3×3 array; optional per-cell element field when elemental rules are enabled.
+- Hands: 5 cards per player (engine uses fixed arrays; exports show shrinking lists).
+- Rules: independent boolean toggles.
+- Hashing: XOR-based Zobrist with incremental updates and 128-bit keys for deterministic state identity.
 
 ---
-🧪 Testing scope
 
-- Engine tests: rule correctness, determinism, allocation‑free hot paths.
-- Solver tests: terminal values, PV determinism.
-- Rule edge tests: Same, Plus, Same Wall, Combo cascades.
+## Performance & Implementation Notes
+
+- Solver: Negamax with αβ pruning and a transposition table (depth-preferred replacement).
+- Move ordering: corners > edges > center, then cell index, then card id.
+- Cascade processing: BFS on queue with ascending indices for deterministic cascades.
+- Throughput: ~10M nodes/sec, ~1M states/sec on a Ryzen 3600 (observed; config-dependent).
+- Training data export: JSONL trajectory or full state-space, deterministic with a fixed seed.
+- Persistence: append-only batch writes, deterministic compaction, optional compression and checkpoint/resume.
+
+---
+
+## Examples
+
+Trajectory (onehot), 10 games, no elements:
+- [`target/release/precompute`](target/release/precompute:1) --export export.jsonl --export-mode trajectory --games 10 --seed 42 --hand-strategy random --rules none --elements none --policy-format onehot --value-mode winloss
+
+Trajectory (mcts policy, 256 rollouts), stratified hands, Elemental+Same, margin:
+- [`target/release/precompute`](target/release/precompute:1) --export export_mcts.jsonl --export-mode trajectory --games 10 --seed 42 --hand-strategy stratified --rules elemental,same --elements random --policy-format mcts --mcts-rollouts 256 --value-mode margin
+
+Trajectory with off-PV weighted stepping @ 20%:
+- [`target/release/precompute`](target/release/precompute:1) --export export_weighted.jsonl --export-mode trajectory --games 100 --seed 123 --hand-strategy random --rules none --elements none --policy-format onehot --off-pv-rate 0.2 --off-pv-strategy weighted
+
+Full state-space export (exhaustive) for one sampled hand pair:
+- [`target/release/precompute`](target/release/precompute:1) --export export_full.jsonl --export-mode full --seed 42 --hand-strategy random --rules none --elements none --policy-format onehot --value-mode winloss
+
+Single-state evaluation (stdin → stdout) example:
+- echo '<single-state-json>' | [`target/release/precompute`](target/release/precompute:1) --eval-state
+
+---
+
+## Testing & Validation
+
+- Engine tests: correctness, rule edge cases, allocation-free hot paths (see tests/).
+- Solver tests: terminal values and PV determinism.
 - Persistence tests: batch flush, compression, checkpoint/resume determinism.
+- Determinism tests include cross-thread JSONL equality for small sample runs.
+
+See test harness and targeted tests in the repository tests/ directory (example files visible in the project root).
 
 ---
-📜 License
 
+## Project Layout (high level)
 
-The code in this repository is provided under an open license (TBD).
-Triple Triad belongs to Square Enix (Final Fantasy VIII). This is a clean‑room reimplementation for research and educational purposes.
+- Core engine: rules, state, hashing, scoring (in [`src/`](src/:1)).
+- Solver: negamax + αβ + TT, PV reconstruction (in [`src/solver/`](src/solver/:1)).
+- Precompute: state enumeration, parallel solve, persistence (in [`src/bin/precompute.rs`](src/bin/precompute.rs:1) and [`src/solver/precompute.rs`](src/solver/precompute.rs:1)).
+- Persistence: batch writes, compression, checkpointing (see [`src/persist.rs`](src/persist.rs:1), [`src/persist_stream.rs`](src/persist_stream.rs:1)).
+- Binaries: precompute, query, tt-cli (see [`src/bin/`](src/bin/:1)).
 
 ---
-🙏 Acknowledgements
 
-- FF8’s Triple Triad ruleset by Square Enix.
-- Chess/Go engine design patterns (negamax, αβ, Zobrist, TT).
-- OpenAI GPT‑5 + Kilo Code for collaborative design and implementation.
+## Roadmap
+
+Near-term
+- Query API: CLI/HTTP service for instant best-move lookups from solved DBs.
+- Analysis experiments: first-player advantage, card/hand Elo, rule impact studies.
+
+Mid-term
+- AI/ML integration: compact NPZ exports, PyTorch dataset utilities, small policy/value nets, AlphaZero-lite self-play.
+- Imperfect-information play: Expectimax/MCTS with hidden hands and opponent models.
+
+Long-term
+- Superhuman assistant with multiple playstyles and human-like modes.
+- Meta-analysis: best-hand search, card tier lists, balance insights.
+
+---
+
+## License & Attribution
+
+- Repository code: open license (TBD). Triple Triad rules belong to Square Enix (Final Fantasy VIII). This repository is a clean‑room reimplementation for research and educational purposes.
+
+---
+
+## Acknowledgements
+
+- FF8’s Triple Triad ruleset (Square Enix)
+- Classic engine patterns: negamax, αβ, Zobrist hashing, transposition tables
+- Inspiration & help from GPT-5/Kilo Code
