@@ -16,7 +16,7 @@ use std::process;
 
 use triplecargo::{
     load_cards_from_json, zobrist_key, Element, GameState, Owner, Rules, apply_move, legal_moves, score, rng_for_state,
-    solver::{search_root, search_root_with_children},
+    solver::{search_root, search_root_with_children, graph_precompute_export},
 };
 use triplecargo::solver::tt_array::FixedTT;
 
@@ -36,6 +36,7 @@ enum HandStrategyOpt {
 enum ExportModeOpt {
     Trajectory,
     Full,
+    Graph,
 }
 
 #[derive(Debug, Clone, ValueEnum)]
@@ -180,6 +181,23 @@ struct Args {
     /// Verbose diagnostics to stderr (eval mode only)
     #[arg(long)]
     verbose: bool,
+
+    // Graph mode input flags (lightweight)
+    /// When true, Graph mode uses explicit hands/elements flags instead of sampling
+    #[arg(long = "graph-input", default_value_t = false)]
+    graph_input: bool,
+
+    /// Graph mode: initial hand for A as comma-separated ids, e.g. "12,34,56,78,90" (required when --graph-input)
+    #[arg(long = "graph-hand-a")]
+    graph_hand_a: Option<String>,
+
+    /// Graph mode: initial hand for B as comma-separated ids, e.g. "22,33,44,55,66" (required when --graph-input)
+    #[arg(long = "graph-hand-b")]
+    graph_hand_b: Option<String>,
+
+    /// Graph mode: per-cell elements as 9 comma-separated entries using letters F,I,T,W,E,P,H,L or '-' for none; no duplicates allowed among elements
+    #[arg(long = "graph-elements")]
+    graph_elements: Option<String>,
 }
 
 fn parse_rules(s: &str) -> Rules {
@@ -1999,6 +2017,121 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 elapsed.as_millis()
             );
 
+            Ok(())
+        }
+        ExportModeOpt::Graph => {
+            // Graph mode: enumerate full game graph for a single initial hand pair + optional elements,
+            // then retrograde solve (two-phase pipeline inside solver::graph).
+            // UX:
+            // - If --graph-input is false (default), sample hands/elements deterministically using --hand-strategy and --seed.
+            // - If --graph-input is true, require --graph-hand-a and --graph-hand-b; optional --graph-elements.
+            //   Each hand must contain 5 unique ids (per hand), ids must exist in cards DB.
+            //   --graph-elements (if provided) must have 9 entries and no duplicate element letters.
+
+            // Helpers (local to arm)
+            fn parse_hand_list(s: &str) -> Result<[u16; 5], String> {
+                let mut out: [u16; 5] = [0; 5];
+                let mut seen: hashbrown::HashSet<u16> = hashbrown::HashSet::new();
+                let parts: Vec<&str> = s.split(',').map(|t| t.trim()).filter(|t| !t.is_empty()).collect();
+                if parts.len() != 5 {
+                    return Err(format!("expected exactly 5 card ids, got {}", parts.len()));
+                }
+                for (i, tok) in parts.iter().enumerate() {
+                    let id: u16 = tok.parse().map_err(|_| format!("invalid card id '{}'", tok))?;
+                    if !seen.insert(id) {
+                        return Err(format!("duplicate card id {} in the same hand", id));
+                    }
+                    out[i] = id;
+                }
+                Ok(out)
+            }
+            fn parse_graph_elements_arg(s: &str) -> Result<[Option<Element>; 9], String> {
+                let mut out: [Option<Element>; 9] = [None; 9];
+                let mut seen_elem: hashbrown::HashSet<Element> = hashbrown::HashSet::new();
+                let parts: Vec<&str> = s.split(',').map(|t| t.trim()).collect();
+                if parts.len() != 9 {
+                    return Err(format!("--graph-elements must have exactly 9 comma-separated entries, got {}", parts.len()));
+                }
+                for (i, tok) in parts.iter().enumerate() {
+                    let opt = if tok.eq_ignore_ascii_case("-") || tok.eq_ignore_ascii_case("none") || tok.eq_ignore_ascii_case("null") || tok.is_empty() {
+                        None
+                    } else {
+                        let ch = tok.chars().next().ok_or_else(|| format!("invalid element token '{}'", tok))?;
+                        let el = elem_from_letter(ch).map_err(|e| format!("invalid element at position {}: {}", i, e))?;
+                        if !seen_elem.insert(el) {
+                            return Err(format!("duplicate element '{}' in --graph-elements", tok));
+                        }
+                        Some(el)
+                    };
+                    out[i] = opt;
+                }
+                Ok(out)
+            }
+
+            let mut rng_state: u64 = args.seed;
+
+            // Decide hands + elements
+            let (hand_a, hand_b, cell_elements): ([u16; 5], [u16; 5], Option<[Option<Element>; 9]>) = if args.graph_input {
+                // Require both hands
+                let ha_s = args.graph_hand_a.as_ref().ok_or_else(|| "--graph-input requires --graph-hand-a".to_string())
+                    .map_err(|e| format!("{}", e)).unwrap();
+                let hb_s = args.graph_hand_b.as_ref().ok_or_else(|| "--graph-input requires --graph-hand-b".to_string())
+                    .map_err(|e| format!("{}", e)).unwrap();
+
+                let ha = parse_hand_list(ha_s).map_err(|e| format!("--graph-hand-a error: {e}"))?;
+                let hb = parse_hand_list(hb_s).map_err(|e| format!("--graph-hand-b error: {e}"))?;
+
+                // Validate against cards DB (ids exist)
+                for id in ha.iter().chain(hb.iter()) {
+                    if cards.get(*id).is_none() {
+                        return Err(format!("Card id {} not found in cards DB", id).into());
+                    }
+                }
+
+                // Optional per-cell elements, with uniqueness constraint
+                let elems = match &args.graph_elements {
+                    Some(es) => Some(parse_graph_elements_arg(es).map_err(|e| format!("--graph-elements error: {e}"))?),
+                    None => None,
+                };
+
+                (ha, hb, elems)
+            } else {
+                // Deterministic sampling
+                let (ha, hb) = match args.hand_strategy {
+                    HandStrategyOpt::Random => {
+                        let mut pool = all_ids_sorted.clone();
+                        let ha = sample_hand_random(&mut pool, &mut rng_state);
+                        let hb = sample_hand_random(&mut pool, &mut rng_state);
+                        (ha, hb)
+                    }
+                    HandStrategyOpt::Stratified => {
+                        let mut bands = bands_master.clone();
+                        let ha = sample_hand_stratified(&mut bands, &mut rng_state);
+                        let hb = sample_hand_stratified(&mut bands, &mut rng_state);
+                        (ha, hb)
+                    }
+                };
+                let elems = match args.elements {
+                    ElementsOpt::None => None,
+                    ElementsOpt::Random => {
+                        let seed_for_elems = splitmix64(&mut rng_state);
+                        Some(gen_elements(seed_for_elems))
+                    }
+                };
+                (ha, hb, elems)
+            };
+
+            let initial = GameState::with_hands(rules, hand_a, hand_b, cell_elements);
+
+            let t_start = Instant::now();
+            if let Err(e) = graph_precompute_export(&initial, &cards, args.max_depth) {
+                return Err(Box::<dyn std::error::Error>::from(format!("graph precompute error: {e}")));
+            }
+            let elapsed = t_start.elapsed();
+            println!(
+                "[export] Done. mode=graph elapsed_ms={}",
+                elapsed.as_millis()
+            );
             Ok(())
         }
     }

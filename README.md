@@ -39,7 +39,7 @@ Triplecargo is both a research-grade solver and the foundation for a superhuman 
 ## Binaries and Modes
 
 - Precompute/export: [`target/release/precompute`](target/release/precompute:1)
-  - Exports JSONL training data (trajectory or full state-space).
+  - Exports training data in three modes: trajectory, full state-space, or graph (two-phase full-graph).
   - Single-state evaluation mode: see the "Single-state evaluation" section and [`src/bin/precompute.rs:555`](src/bin/precompute.rs:555).
 
 - Query service: [`target/release/query`](target/release/query:1)
@@ -52,6 +52,7 @@ Source entry points:
 - Root search + child Q values: [`src/solver/negamax.rs:98`](src/solver/negamax.rs:98).
 - Heuristic simulation helpers: [`src/engine/apply.rs:224`](src/engine/apply.rs:224), [`src/engine/apply.rs:33`](src/engine/apply.rs:33).
 - Board cell elements: [`src/board.rs:56`](src/board.rs:56).
+- Graph pipeline: [rust.enumerate_graph()](src/solver/graph.rs:175), [rust.retrograde_solve()](src/solver/graph.rs:256), [rust.graph_precompute_export()](src/solver/graph.rs:396).
 
 ---
 
@@ -62,11 +63,24 @@ The following documents the flags accepted by the precompute/export binary (`[`t
 Top-level export
 - --export PATH
   - JSONL output file path (required for export runs).
-- --export-mode trajectory|full
+- --export-mode trajectory|full|graph
   - trajectory (default): emit a single 9-state PV trajectory per sampled game.
   - full: emit the entire reachable state space for one sampled hand pair (exhaustive).
+  - graph: two-phase full-graph pipeline. Phase A enumerates all reachable states with a sharded visited set; Phase B performs a bottom‑up retrograde solve (depth 9 → 0) to compute exact values and best_move for every state deterministically. Requires full depth; if `--max-depth` would truncate, Graph mode returns an error.
 - --games N
-  - Number of sampled games (trajectory mode only; ignored in full mode).
+  - Number of sampled games (trajectory mode only; ignored in full and graph modes).
+Graph explicit input flags (only for --export-mode graph)
+- --graph-input
+  - When true, Graph mode uses explicit hands/elements flags instead of sampling.
+  - When false (default), Graph mode samples hands/elements deterministically using --hand-strategy and --seed (mirrors Full mode sampling).
+- --graph-hand-a "id1,id2,id3,id4,id5"
+  - Required when --graph-input is true. Exactly 5 card ids, unique within the hand; validated against cards DB.
+- --graph-hand-b "id1,id2,id3,id4,id5"
+  - Required when --graph-input is true. Exactly 5 card ids, unique within the hand; validated against cards DB.
+  - Note: A and B hands may contain the same card id (cross-hand duplicates allowed); only intra-hand duplicates are rejected.
+- --graph-elements "E0,E1,E2,E3,E4,E5,E6,E7,E8"
+  - Optional when --graph-input is true. Exactly 9 comma-separated tokens using letters F,I,T,W,E,P,H,L or '-' (none).
+  - Constraint: the 8 element letters must not repeat across the 9 cells (no duplicate element letters). '-' entries are ignored for this check.
 
 Parallelism & scheduling
 - --threads N
@@ -135,6 +149,28 @@ Heuristic feature weights
 Progress & determinism notes
 - The writer thread buffers out-of-order arrivals and writes games in strict increasing game_id order to guarantee byte-for-byte identical JSONL output across different --threads and --chunk-size values when the seed + flags are identical.
 - Worker behavior and scheduling are deterministic functions of (seed, game_id, worker_id, chunk_size).
+## Graph mode (two-phase full-graph)
+
+Graph mode builds an exact, deterministic value/best_move label for every reachable state from a single sampled initial hand pair (+ optional elements). It proceeds in two phases:
+
+- Phase A — Enumeration: parallel BFS by ply with a sharded visited set to avoid duplicates. See [rust.enumerate_graph()](src/solver/graph.rs:175).
+- Phase B — Retrograde solve: bottom-up dynamic programming from ply 9 (terminal) back to the root (0), computing exact values and the lexicographically-first optimal move at each state. See [rust.retrograde_solve()](src/solver/graph.rs:256).
+
+Properties:
+- Deterministic by construction (stable move order; tie-break is “first in legal_moves order”).
+- Requires full depth (to ply 9). If `--max-depth` would truncate, Graph mode errors out early.
+- Current output: per-depth counts and a root summary printed to stderr. JSONL emission using retrograde labels is planned.
+
+CLI summary:
+- `--export-mode graph`
+- `--games` is ignored (graph solves exactly one sampled initial pair).
+- `--hand-strategy`, `--rules`, `--elements`, and `--seed` control the initial state.
+- `--tt-bytes` has no effect during retrograde (no search is used); it still applies in other modes.
+
+Implementation references:
+- Entry: [rust.graph_precompute_export()](src/solver/graph.rs:396)
+- Enumeration: [rust.enumerate_graph()](src/solver/graph.rs:175)
+- Retrograde: [rust.retrograde_solve()](src/solver/graph.rs:256)
 
 Single-state evaluation
 - Mode: read exactly one JSON object from stdin and write exactly one JSON object to stdout.
@@ -295,6 +331,9 @@ Trajectory with off-PV weighted stepping @ 20%:
 Full state-space export (exhaustive) for one sampled hand pair:
 - [`target/release/precompute`](target/release/precompute:1) --export export_full.jsonl --export-mode full --seed 42 --hand-strategy random --rules none --elements none --policy-format onehot --value-mode winloss
 
+Graph (two-phase full-graph) for one sampled hand pair + elements (prints per-depth counts and root summary):
+- [`target/release/precompute`](target/release/precompute:1) --export export_graph.jsonl --export-mode graph --seed 42 --hand-strategy random --rules none --elements random
+
 Single-state evaluation (stdin → stdout) example:
 - echo '<single-state-json>' | [`target/release/precompute`](target/release/precompute:1) --eval-state
 
@@ -316,6 +355,7 @@ See test harness and targeted tests in the repository tests/ directory (example 
 - Core engine: rules, state, hashing, scoring (in [`src/`](src/:1)).
 - Solver: negamax + αβ + TT, PV reconstruction (in [`src/solver/`](src/solver/:1)).
 - Precompute: state enumeration, parallel solve, persistence (in [`src/bin/precompute.rs`](src/bin/precompute.rs:1) and [`src/solver/precompute.rs`](src/solver/precompute.rs:1)).
+- Graph pipeline: enumeration and retrograde solver (in [`src/solver/graph.rs`](src/solver/graph.rs:1)).
 - Persistence: batch writes, compression, checkpointing (see [`src/persist.rs`](src/persist.rs:1), [`src/persist_stream.rs`](src/persist_stream.rs:1)).
 - Binaries: precompute, query, tt-cli (see [`src/bin/`](src/bin/:1)).
 
