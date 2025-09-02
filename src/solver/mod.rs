@@ -7,12 +7,16 @@ pub mod move_order;
 pub mod precompute;
 pub mod tt_array;
 pub mod graph;
+pub mod graph_writer;
  
 pub use negamax::{negamax, reconstruct_pv, search_root, search_root_with_children};
 pub use tt::{Bound, InMemoryTT, TranspositionTable, TTEntry};
 pub use precompute::{precompute_solve, PrecomputeStats};
 pub use graph::graph_precompute_export;
 pub use crate::persist::ElementsMode;
+// New exports for high-throughput Graph mode
+pub use graph::{graph_precompute_export_with_sink, GraphExportOutcome};
+pub use graph_writer::{GraphJsonlSink, GraphSinkStats, PlainJsonlWriter, ZstdFramesJsonlWriter};
  
 #[derive(Debug, Clone, Copy)]
 pub struct SearchLimits {

@@ -198,6 +198,32 @@ struct Args {
     /// Graph mode: per-cell elements as 9 comma-separated entries using letters F,I,T,W,E,P,H,L or '-' for none; no duplicates allowed among elements
     #[arg(long = "graph-elements")]
     graph_elements: Option<String>,
+
+    // ---- Graph mode compression and indexing flags ----
+
+    /// Enable zstd compression of node streams (default: true)
+    #[arg(long = "zstd", default_value_t = true)]
+    zstd: bool,
+
+    /// Alias for disabling compression (equivalent to --zstd=false)
+    #[arg(long = "no-compress", default_value_t = false, visible_alias = "nocompress")]
+    no_compress: bool,
+
+    /// Zstd compression level (1..=10, default 3)
+    #[arg(long = "zstd-level", default_value_t = 3)]
+    zstd_level: i32,
+
+    /// Zstd worker threads (default: min(4, available_parallelism()))
+    #[arg(long = "zstd-threads")]
+    zstd_threads: Option<usize>,
+
+    /// Target number of JSONL records per zstd frame (default: 131072)
+    #[arg(long = "zstd-frame-lines", default_value_t = 131072)]
+    zstd_frame_lines: usize,
+
+    /// Emit nodes.idx.jsonl (one line per frame) when zstd is enabled (default: true)
+    #[arg(long = "zstd-index", default_value_t = true)]
+    zstd_index: bool,
 }
 
 fn parse_rules(s: &str) -> Rules {
@@ -1419,9 +1445,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     };
 
-    // Output file
-    let file = File::create(export_path).map_err(|e| format!("Failed to create export file: {e}"))?;
-    let mut writer = BufWriter::new(file);
 
     // Static resources for sampling
     let all_ids_sorted = all_card_ids_sorted(&cards);
@@ -1501,6 +1524,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             };
             println!("[export] chunk_size={}", effective_chunk_size);
+
+            // Create output JSONL file for trajectory export
+            let file = File::create(export_path).map_err(|e| format!("Failed to create export file: {e}"))?;
+            let mut writer = BufWriter::new(file);
 
             // Shared resources
             let cards_arc = Arc::new(cards);
@@ -1874,6 +1901,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let initial = GameState::with_hands(rules, hand_a, hand_b, cell_elements);
 
+            // Create output JSONL file for full export
+            let file = File::create(export_path).map_err(|e| format!("Failed to create export file: {e}"))?;
+            let mut writer = BufWriter::new(file);
+
             // Enumerate via DFS, computing labels with search_root
             let mut out: Vec<ExportRecord> = Vec::new();
             let mut visited: hashbrown::HashSet<u128> = hashbrown::HashSet::default();
@@ -2123,14 +2154,162 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let initial = GameState::with_hands(rules, hand_a, hand_b, cell_elements);
 
-            let t_start = Instant::now();
-            if let Err(e) = graph_precompute_export(&initial, &cards, args.max_depth, &mut writer) {
-                return Err(Box::<dyn std::error::Error>::from(format!("graph precompute error: {e}")));
+            // Determine export directory semantics for Graph mode
+            let export_dir = export_path;
+            // Verify directory or create it
+            if export_dir.exists() {
+                let meta = std::fs::metadata(export_dir).map_err(|e| format!("stat export path error: {e}"))?;
+                if !meta.is_dir() {
+                    return Err(format!("--export path '{}' exists and is not a directory. Graph mode requires a directory.", export_dir.display()).into());
+                }
+            } else {
+                std::fs::create_dir_all(export_dir).map_err(|e| format!("create export directory error: {e}"))?;
             }
+
+            // Resolve compression settings
+            let mut zstd_enabled = args.zstd && !args.no_compress;
+            let zstd_level = args.zstd_level.clamp(1, 10);
+            let zstd_threads: usize = match args.zstd_threads {
+                Some(v) => v.max(1),
+                None => {
+                    let n = std::thread::available_parallelism().map(|nz| nz.get()).unwrap_or(1);
+                    n.min(4).max(1)
+                }
+            };
+            let frame_lines = args.zstd_frame_lines.max(1);
+            let index_enabled = args.zstd_index && zstd_enabled;
+
+            // Build file paths
+            let nodes_name = if zstd_enabled { "nodes.jsonl.zst" } else { "nodes.jsonl" };
+            let nodes_path = export_dir.join(nodes_name);
+            // Open nodes file
+            let nodes_file = File::create(&nodes_path).map_err(|e| format!("create nodes file error: {e}"))?;
+
+            let idx_path_opt = if index_enabled {
+                Some(export_dir.join("nodes.idx.jsonl"))
+            } else {
+                None
+            };
+            let idx_file_opt = match idx_path_opt.as_ref() {
+                Some(p) => Some(File::create(p).map_err(|e| format!("create index file error: {e}"))?),
+                None => None,
+            };
+
+            // Construct sink
+            let mut sink_box: Box<dyn triplecargo::solver::GraphJsonlSink> = if zstd_enabled {
+                Box::new(triplecargo::solver::ZstdFramesJsonlWriter::new(
+                    nodes_file,
+                    idx_file_opt,
+                    16 * 1024 * 1024,     // nodes BufWriter capacity
+                    zstd_level,
+                    zstd_threads,
+                    frame_lines,
+                    32 * 1024 * 1024,     // frame max bytes
+                ))
+            } else {
+                Box::new(triplecargo::solver::PlainJsonlWriter::new(
+                    nodes_file,
+                    16 * 1024 * 1024,
+                ))
+            };
+
+            // Run high-throughput export through sink
+            let t_start = Instant::now();
+            let outcome_res = triplecargo::solver::graph_precompute_export_with_sink(&initial, &cards, args.max_depth, &mut *sink_box);
+
+            // If zstd was requested but failed (e.g., codec unavailable), fall back to plain JSONL
+            let (outcome, stats, final_nodes_name, final_index_name, compression_enabled) = match outcome_res {
+                Ok(o) => {
+                    let stats = triplecargo::solver::GraphJsonlSink::finish_mut(&mut *sink_box)
+                        .map_err(|e| format!("finalize sink error: {e}"))?;
+                    let idx_name = if index_enabled && stats.index_sha256_hex.is_some() { Some("nodes.idx.jsonl".to_string()) } else { None };
+                    (o, stats, nodes_name.to_string(), idx_name, zstd_enabled)
+                }
+                Err(e) if zstd_enabled => {
+                    eprintln!("[graph] zstd writer failed: {e}. Falling back to uncompressed JSONL.");
+                    // Re-open plain writer and rerun
+                    let plain_nodes_name = "nodes.jsonl".to_string();
+                    let plain_nodes_path = export_dir.join(&plain_nodes_name);
+                    let plain_nodes_file = File::create(&plain_nodes_path).map_err(|e| format!("create plain nodes file error: {e}"))?;
+                    zstd_enabled = false;
+                    let mut plain_sink = triplecargo::solver::PlainJsonlWriter::new(plain_nodes_file, 16 * 1024 * 1024);
+                    let outcome2 = triplecargo::solver::graph_precompute_export_with_sink(&initial, &cards, args.max_depth, &mut plain_sink)
+                        .map_err(|e| format!("graph export retry (plain) error: {e}"))?;
+                    let stats2 = triplecargo::solver::GraphJsonlSink::finish_mut(&mut plain_sink)
+                        .map_err(|e| format!("finalize plain sink error: {e}"))?;
+                    (outcome2, stats2, plain_nodes_name, None, false)
+                }
+                Err(e) => {
+                    return Err(Box::<dyn std::error::Error>::from(format!("graph precompute error: {e}")));
+                }
+            };
+
             let elapsed = t_start.elapsed();
+
+            // Build manifest JSON
+            let manifest_name = "graph.manifest.json";
+            let manifest_path = export_dir.join(manifest_name);
+
+            let compression_obj = if compression_enabled {
+                serde_json::json!({
+                    "codec": "zstd",
+                    "enabled": true,
+                    "level": zstd_level,
+                    "threads": zstd_threads,
+                    "frame_lines": frame_lines as u64,
+                    "frame_count": stats.frame_count,
+                    "indexed": stats.index_sha256_hex.is_some(),
+                })
+            } else {
+                serde_json::json!({
+                    "codec": "none",
+                    "enabled": false,
+                    "level": serde_json::Value::Null,
+                    "threads": serde_json::Value::Null,
+                    "frame_lines": serde_json::Value::Null,
+                    "frame_count": 0,
+                    "indexed": false,
+                })
+            };
+
+            let files_obj = serde_json::json!({
+                "nodes": final_nodes_name,
+                "index": final_index_name,
+                "manifest": manifest_name,
+            });
+
+            let integrity_obj = serde_json::json!({
+                "nodes_sha256": stats.nodes_sha256_hex,
+                "index_sha256": stats.index_sha256_hex,
+            });
+
+            let totals_obj = serde_json::json!({
+                "states": outcome.totals_states,
+                "terminals": outcome.totals_terminals,
+                "by_depth": outcome.totals_by_depth,
+            });
+
+            let manifest = serde_json::json!({
+                "files": files_obj,
+                "compression": compression_obj,
+                "totals": totals_obj,
+                "integrity": integrity_obj,
+                "logical_checksum": outcome.logical_checksum_hex,
+            });
+
+            // Write manifest
+            {
+                let mut mf = File::create(&manifest_path).map_err(|e| format!("create manifest file error: {e}"))?;
+                let buf = serde_json::to_vec_pretty(&manifest).map_err(|e| format!("serialize manifest error: {e}"))?;
+                mf.write_all(&buf).map_err(|e| format!("write manifest error: {e}"))?;
+            }
+
             println!(
-                "[export] Done. mode=graph elapsed_ms={}",
-                elapsed.as_millis()
+                "[export] Done. mode=graph elapsed_ms={} nodes_file={} indexed={} frames={}",
+                elapsed.as_millis(),
+                export_dir.join(&final_nodes_name).display(),
+                compression_enabled && stats.index_sha256_hex.is_some(),
+                stats.frame_count
             );
             Ok(())
         }
