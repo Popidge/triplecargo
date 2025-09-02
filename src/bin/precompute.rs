@@ -16,7 +16,7 @@ use std::process;
 
 use triplecargo::{
     load_cards_from_json, zobrist_key, Element, GameState, Owner, Rules, apply_move, legal_moves, score, rng_for_state,
-    solver::{search_root, search_root_with_children, graph_precompute_export},
+    solver::{search_root, search_root_with_children},
 };
 use triplecargo::solver::tt_array::FixedTT;
 
@@ -879,7 +879,7 @@ fn sample_from_probs(
     let r: f64 = rng.gen::<f64>();
     let mut acc: f64 = 0.0;
     for (i, &p) in probs.iter().enumerate() {
-        acc += (p as f64);
+        acc += p as f64;
         if r < acc {
             return Some(moves[i]);
         }
@@ -1527,7 +1527,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             // Create output JSONL file for trajectory export
             let file = File::create(export_path).map_err(|e| format!("Failed to create export file: {e}"))?;
-            let mut writer = BufWriter::new(file);
+            let writer = BufWriter::new(file);
 
             // Shared resources
             let cards_arc = Arc::new(cards);

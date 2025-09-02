@@ -14,7 +14,6 @@ use hashbrown::HashMap as HbHashMap;
 use rayon::prelude::*;
 use indicatif::{ProgressBar, ProgressStyle, MultiProgress};
 use serde::Serialize;
-use serde_json::json;
  
 use crate::board::{Board};
 use crate::cards::CardsDb;
@@ -25,7 +24,7 @@ use crate::rules::Rules;
 use crate::state::{GameState, legal_moves};
 use crate::types::{Owner};
 
-use crate::solver::graph_writer::{GraphJsonlSink, GraphSinkStats};
+use crate::solver::graph_writer::GraphJsonlSink;
 use sha2::{Digest, Sha256};
 type FastHasher = BuildHasherDefault<ahash::AHasher>;
 type FastSet = HbHashSet<u128, FastHasher>;
@@ -921,6 +920,14 @@ pub fn graph_precompute_export_with_sink(
 
     // JSONL export through sink: iterate layers in increasing depth (0..9)
     let (initial_a, initial_b) = extract_initial_hands(initial);
+    // Writing progress bar
+    let write_total = totals_states;
+    let write_pb = ProgressBar::new(write_total);
+    write_pb.set_style(
+        ProgressStyle::with_template("[{elapsed_precise}] write {bar:40.cyan/blue} {pos}/{len}")
+            .unwrap()
+            .progress_chars("=>-"),
+    );
     let mut lines_written: usize = 0;
     let mut hasher = Sha256::new();
 
@@ -1004,6 +1011,7 @@ pub fn graph_precompute_export_with_sink(
             // Serialize and write via sink
             let s = serde_json::to_vec(&line)?;
             sink.write_line(&s, state.board.filled_count())?;
+            write_pb.inc(1);
             lines_written += 1;
 
             // Logical checksum update: (state_hash|value|best_move or -)
@@ -1015,9 +1023,10 @@ pub fn graph_precompute_export_with_sink(
             hasher.update(tuple.as_bytes());
         }
     }
-
+ 
+    write_pb.finish_and_clear();
     eprintln!("[graph] export lines written: {}", lines_written);
-
+ 
     let logical_checksum_hex = hex::encode(hasher.finalize());
 
     Ok(GraphExportOutcome {
