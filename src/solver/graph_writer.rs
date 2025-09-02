@@ -1,6 +1,9 @@
 use sha2::{Digest, Sha256};
 use std::fs::File;
-use std::io::{self, BufWriter, Seek, Write};
+use std::io::{self, BufWriter, Write};
+
+/// Default buffer size for BufWriter in graph JSONL sinks (32 MiB)
+pub const BUF_WRITER_CAP_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct GraphSinkStats {
@@ -20,14 +23,16 @@ pub struct PlainJsonlWriter {
     nodes: BufWriter<File>,
     hasher_nodes: Sha256,
     total_lines: u64,
+    sync_final: bool,
 }
 
 impl PlainJsonlWriter {
-    pub fn new(nodes_file: File, buf_bytes: usize) -> Self {
+    pub fn new(nodes_file: File, buf_bytes: usize, sync_final: bool) -> Self {
         Self {
             nodes: BufWriter::with_capacity(buf_bytes.max(1024 * 1024), nodes_file),
             hasher_nodes: Sha256::new(),
             total_lines: 0,
+            sync_final,
         }
     }
 }
@@ -43,7 +48,13 @@ impl GraphJsonlSink for PlainJsonlWriter {
     }
 
     fn finish_mut(&mut self) -> io::Result<GraphSinkStats> {
+        // Single-flush policy: flush once at the end
         self.nodes.flush()?;
+        // Optional final fsync for crash safety
+        if self.sync_final {
+            // Safe: BufWriter holds a File
+            self.nodes.get_ref().sync_all()?;
+        }
         let digest = std::mem::take(&mut self.hasher_nodes).finalize();
         Ok(GraphSinkStats {
             total_lines: self.total_lines,
@@ -56,20 +67,23 @@ impl GraphJsonlSink for PlainJsonlWriter {
 
 /*************** Zstd frames JSONL writer (compressed) ***************/
 
-// Helper Write impl that forwards into a BufWriter<File> and updates a SHA256 simultaneously.
+// Helper Write impl that forwards into a BufWriter<File>, updates a SHA256, and tracks total bytes written.
 struct HashingFileWrite<'a> {
     inner: &'a mut BufWriter<File>,
     hasher: &'a mut Sha256,
+    pos: &'a mut u64,
 }
 
 impl<'a> Write for HashingFileWrite<'a> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let n = self.inner.write(buf)?;
         self.hasher.update(&buf[..n]);
+        *self.pos = (*self.pos).saturating_add(n as u64);
         Ok(n)
     }
     fn flush(&mut self) -> io::Result<()> {
-        self.inner.flush()
+        // Defer outer BufWriter flushing to sink finalize for single-flush policy
+        Ok(())
     }
 }
 
@@ -79,6 +93,9 @@ pub struct ZstdFramesJsonlWriter {
 
     hasher_nodes: Sha256,
     hasher_idx: Option<Sha256>,
+
+    // Tracks total compressed bytes written so far (for index offsets).
+    compressed_pos: u64,
 
     // Accumulator for one frame worth of JSONL (uncompressed)
     frame_buf: Vec<u8>,
@@ -98,6 +115,9 @@ pub struct ZstdFramesJsonlWriter {
     // Compression config
     zstd_level: i32,
     zstd_threads: usize,
+
+    // Final fsync policy
+    sync_final: bool,
 }
 
 impl ZstdFramesJsonlWriter {
@@ -109,6 +129,7 @@ impl ZstdFramesJsonlWriter {
         zstd_threads: usize,
         frame_lines_target: usize,
         frame_max_bytes: usize,
+        sync_final: bool,
     ) -> Self {
         let idx = idx_file.map(|f| BufWriter::with_capacity(buf_bytes.max(1024 * 1024), f));
         let hasher_idx = idx.as_ref().map(|_| Sha256::new());
@@ -117,7 +138,9 @@ impl ZstdFramesJsonlWriter {
             idx,
             hasher_nodes: Sha256::new(),
             hasher_idx,
-            frame_buf: Vec::with_capacity(frame_max_bytes.max(1024 * 1024)),
+            compressed_pos: 0,
+            // Reserve for large frames: at least 128 MiB or requested frame_max_bytes
+            frame_buf: Vec::with_capacity(frame_max_bytes.max(128 * 1024 * 1024)),
             frame_lines_target: frame_lines_target.max(1),
             frame_max_bytes: frame_max_bytes.max(1 * 1024 * 1024),
             frame_lines_count: 0,
@@ -128,6 +151,7 @@ impl ZstdFramesJsonlWriter {
             cur_turn_max: None,
             zstd_level,
             zstd_threads: zstd_threads.max(1),
+            sync_final,
         }
     }
 
@@ -136,17 +160,16 @@ impl ZstdFramesJsonlWriter {
             return Ok(());
         }
 
-        // Ensure buffered data is on disk so we can read a correct compressed offset
-        self.nodes.flush()?;
-        // Compressed byte offset at start of this new frame
-        let offset = self.nodes.get_ref().stream_position()?;
+        // Compressed byte offset at start of this new frame (tracked internally; no pre-flush)
+        let offset = self.compressed_pos;
 
         // Create a zstd encoder that writes compressed bytes directly to nodes,
-        // while hashing those bytes for nodes SHA256.
+        // while hashing those bytes for nodes SHA256, and updates compressed_pos.
         {
             let mut hashing_writer = HashingFileWrite {
                 inner: &mut self.nodes,
                 hasher: &mut self.hasher_nodes,
+                pos: &mut self.compressed_pos,
             };
             let mut encoder =
                 zstd::stream::write::Encoder::new(&mut hashing_writer, self.zstd_level)?;
@@ -154,7 +177,7 @@ impl ZstdFramesJsonlWriter {
             let _ = encoder.multithread(self.zstd_threads as u32);
             // We don't set content size as it's streaming/unknown
             encoder.write_all(&self.frame_buf)?;
-            // Finish to flush frame footer and return inner writer
+            // Finish to flush frame footer into the inner writer (position updated by HashingFileWrite)
             let _inner = encoder.finish();
             // hashing_writer drops here; nodes remains borrowed mutably within self
         }
@@ -233,9 +256,17 @@ impl GraphJsonlSink for ZstdFramesJsonlWriter {
     fn finish_mut(&mut self) -> io::Result<GraphSinkStats> {
         // Flush any partial frame
         self.flush_frame()?;
+        // Single-flush policy: flush once at the end
         self.nodes.flush()?;
         if let Some(idx) = self.idx.as_mut() {
             idx.flush()?;
+        }
+        // Optional final fsync for crash safety (Linux target)
+        if self.sync_final {
+            self.nodes.get_ref().sync_all()?;
+            if let Some(idx_ref) = self.idx.as_ref() {
+                idx_ref.get_ref().sync_all()?;
+            }
         }
 
         let nodes_digest = std::mem::take(&mut self.hasher_nodes).finalize();

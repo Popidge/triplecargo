@@ -52,6 +52,14 @@ enum ValueModeOpt {
 }
 
 #[derive(Debug, Clone, ValueEnum)]
+enum SyncModeOpt {
+    #[clap(name = "none")]
+    None,
+    #[clap(name = "final")]
+    Final,
+}
+
+#[derive(Debug, Clone, ValueEnum)]
 enum OffPvStrategyOpt {
     Random,
     Weighted,
@@ -221,9 +229,17 @@ struct Args {
     #[arg(long = "zstd-frame-lines", default_value_t = 131072)]
     zstd_frame_lines: usize,
 
+    /// Target maximum uncompressed bytes per zstd frame (soft cap; default: 128 MiB)
+    #[arg(long = "zstd-frame-bytes", default_value_t = 134217728)]
+    zstd_frame_bytes: usize,
+ 
     /// Emit nodes.idx.jsonl (one line per frame) when zstd is enabled (default: true)
     #[arg(long = "zstd-index", default_value_t = true)]
     zstd_index: bool,
+
+    /// Sync policy for graph export files: none | final (default: final)
+    #[arg(long = "sync-mode", value_enum, default_value_t = SyncModeOpt::Final)]
+    sync_mode: SyncModeOpt,
 }
 
 fn parse_rules(s: &str) -> Rules {
@@ -2196,20 +2212,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
 
             // Construct sink
+            let sync_final = matches!(args.sync_mode, SyncModeOpt::Final);
+            let buf_cap = triplecargo::solver::graph_writer::BUF_WRITER_CAP_BYTES;
+            let frame_bytes = args.zstd_frame_bytes;
+
             let mut sink_box: Box<dyn triplecargo::solver::GraphJsonlSink> = if zstd_enabled {
                 Box::new(triplecargo::solver::ZstdFramesJsonlWriter::new(
                     nodes_file,
                     idx_file_opt,
-                    16 * 1024 * 1024,     // nodes BufWriter capacity
+                    buf_cap,            // nodes BufWriter capacity (32 MiB)
                     zstd_level,
                     zstd_threads,
                     frame_lines,
-                    32 * 1024 * 1024,     // frame max bytes
+                    frame_bytes,        // frame max bytes (soft cap)
+                    sync_final,
                 ))
             } else {
                 Box::new(triplecargo::solver::PlainJsonlWriter::new(
                     nodes_file,
-                    16 * 1024 * 1024,
+                    buf_cap,
+                    sync_final,
                 ))
             };
 
@@ -2232,7 +2254,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let plain_nodes_path = export_dir.join(&plain_nodes_name);
                     let plain_nodes_file = File::create(&plain_nodes_path).map_err(|e| format!("create plain nodes file error: {e}"))?;
                     zstd_enabled = false;
-                    let mut plain_sink = triplecargo::solver::PlainJsonlWriter::new(plain_nodes_file, 16 * 1024 * 1024);
+                    let mut plain_sink = triplecargo::solver::PlainJsonlWriter::new(
+                        plain_nodes_file,
+                        buf_cap,
+                        sync_final,
+                    );
                     let outcome2 = triplecargo::solver::graph_precompute_export_with_sink(&initial, &cards, args.max_depth, &mut plain_sink)
                         .map_err(|e| format!("graph export retry (plain) error: {e}"))?;
                     let stats2 = triplecargo::solver::GraphJsonlSink::finish_mut(&mut plain_sink)
