@@ -7,11 +7,14 @@
 use std::error::Error;
 use std::hash::BuildHasherDefault;
 use std::sync::{Arc, Mutex};
+use std::io::Write;
 
 use hashbrown::HashSet as HbHashSet;
 use hashbrown::HashMap as HbHashMap;
 use rayon::prelude::*;
 use indicatif::{ProgressBar, ProgressStyle, MultiProgress};
+use serde::Serialize;
+use serde_json::json;
  
 use crate::board::{Board};
 use crate::cards::CardsDb;
@@ -401,10 +404,68 @@ fn retrograde_solve(
 /// - Validate full-depth requirement
 /// - Enumerate graph to ply 9
 /// - Retrograde exact solve 9 -> 0
+#[derive(Debug, Serialize)]
+struct ExportBoardCell {
+    cell: u8,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    card_id: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    owner: Option<char>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    element: Option<Option<char>>,
+}
+
+#[derive(Debug, Serialize)]
+struct ExportHands {
+    #[serde(rename = "A")]
+    a: Vec<u16>,
+    #[serde(rename = "B")]
+    b: Vec<u16>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+enum ExportPolicy {
+    Move { card_id: u16, cell: u8 },
+    Dist(serde_json::Value),
+}
+
+#[derive(Debug, Serialize)]
+struct ExportLine {
+    game_id: usize,
+    state_idx: u8,
+    board: Vec<ExportBoardCell>,
+    hands: ExportHands,
+    to_move: char,
+    turn: u8,
+    rules: Rules,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    policy_target: Option<ExportPolicy>,
+    value_target: i8,
+    value_mode: String,
+    off_pv: bool,
+    state_hash: String,
+}
+
+#[inline]
+fn element_letter_local(e: crate::types::Element) -> char {
+    match e {
+        crate::types::Element::Fire => 'F',
+        crate::types::Element::Ice => 'I',
+        crate::types::Element::Thunder => 'T',
+        crate::types::Element::Water => 'W',
+        crate::types::Element::Earth => 'E',
+        crate::types::Element::Poison => 'P',
+        crate::types::Element::Holy => 'H',
+        crate::types::Element::Wind => 'L',
+    }
+}
+
 pub fn graph_precompute_export(
     initial: &GameState,
     cards: &CardsDb,
     max_depth: Option<u8>,
+    out: &mut dyn Write,
 ) -> Result<(), Box<dyn Error>> {
     // Enforce full-depth only for Graph mode
     let start_filled = initial.board.filled_count();
@@ -565,7 +626,7 @@ pub fn graph_precompute_export(
 
     // Root summary
     let root_key = zobrist_key(initial);
-    if let Some(root) = entries_by_depth[ start_filled as usize ].get(&root_key) {
+    if let Some(root) = entries_by_depth[start_filled as usize].get(&root_key) {
         eprintln!(
             "[graph] root depth={} value={} best_move={:?}",
             9 - start_filled,
@@ -575,8 +636,95 @@ pub fn graph_precompute_export(
     } else {
         eprintln!("[graph] root not found in retrograde results (unexpected)");
     }
- 
-    // Future: integrate JSONL export using entries_by_depth values and best_moves.
- 
+
+    // JSONL export: iterate layers in increasing depth (0..9) and emit one line per state.
+    // Value target is winloss (side-to-move perspective), policy_target is onehot best_move when non-terminal.
+    let (initial_a, initial_b) = extract_initial_hands(initial);
+    let mut lines_written: usize = 0;
+
+    for d in 0..=9 {
+        let layer = &buckets.layers[d];
+        let map = &entries_by_depth[d];
+        for (key, packed) in layer {
+            let state = packed.to_state(initial_a, initial_b);
+
+            // Hands snapshot vectors (compact ascending)
+            let mut ha: Vec<u16> = Vec::with_capacity(5);
+            let mut hb: Vec<u16> = Vec::with_capacity(5);
+            for &o in state.hands_a.iter() {
+                if let Some(id) = o {
+                    ha.push(id);
+                }
+            }
+            for &o in state.hands_b.iter() {
+                if let Some(id) = o {
+                    hb.push(id);
+                }
+            }
+
+            // Board cells
+            let mut board_vec: Vec<ExportBoardCell> = Vec::with_capacity(9);
+            let elemental_enabled = state.rules.elemental;
+            for cell in 0u8..9 {
+                let slot = state.board.get(cell);
+                let (card_id, owner) = match slot {
+                    Some(s) => (Some(s.card_id), Some(match s.owner { Owner::A => 'A', Owner::B => 'B' })),
+                    None => (None, None),
+                };
+                let element_field: Option<Option<char>> = if elemental_enabled {
+                    Some(state.board.cell_element(cell).map(element_letter_local))
+                } else {
+                    None
+                };
+                board_vec.push(ExportBoardCell { cell, card_id, owner, element: element_field });
+            }
+
+            // to_move
+            let to_move = match state.next { Owner::A => 'A', Owner::B => 'B' };
+
+            // Lookup retrograde entry for this state
+            let entry = match map.get(key) {
+                Some(e) => *e,
+                None => {
+                    // Should not happen; skip or compute fallback
+                    let mut v = score(&state);
+                    if state.next == Owner::B {
+                        v = -v;
+                    }
+                    RetroEntry { value: v, best_move: None }
+                }
+            };
+
+            // policy_target: best_move when non-terminal
+            let policy_target = if !state.is_terminal() {
+                entry.best_move.map(|m| ExportPolicy::Move { card_id: m.card_id, cell: m.cell })
+            } else {
+                None
+            };
+
+            let line = ExportLine {
+                game_id: 0,
+                state_idx: state.board.filled_count(),
+                board: board_vec,
+                hands: ExportHands { a: ha, b: hb },
+                to_move,
+                turn: state.board.filled_count(),
+                rules: state.rules,
+                policy_target,
+                value_target: if entry.value > 0 { 1 } else if entry.value < 0 { -1 } else { 0 },
+                value_mode: "winloss".to_string(),
+                off_pv: false,
+                state_hash: format!("{:032x}", zobrist_key(&state)),
+            };
+
+            let s = serde_json::to_string(&line)?;
+            out.write_all(s.as_bytes())?;
+            out.write_all(b"\n")?;
+            lines_written += 1;
+        }
+    }
+
+    eprintln!("[graph] export lines written: {}", lines_written);
+
     Ok(())
 }

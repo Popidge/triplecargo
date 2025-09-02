@@ -2124,7 +2124,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let initial = GameState::with_hands(rules, hand_a, hand_b, cell_elements);
 
             let t_start = Instant::now();
-            if let Err(e) = graph_precompute_export(&initial, &cards, args.max_depth) {
+            if let Err(e) = graph_precompute_export(&initial, &cards, args.max_depth, &mut writer) {
                 return Err(Box::<dyn std::error::Error>::from(format!("graph precompute error: {e}")));
             }
             let elapsed = t_start.elapsed();
