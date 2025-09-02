@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 use hashbrown::HashSet as HbHashSet;
 use hashbrown::HashMap as HbHashMap;
 use rayon::prelude::*;
+use indicatif::{ProgressBar, ProgressStyle, MultiProgress};
  
 use crate::board::{Board};
 use crate::cards::CardsDb;
@@ -417,23 +418,150 @@ pub fn graph_precompute_export(
         }
     }
 
+    // Progress: enumeration spinner
+    let en_pb = ProgressBar::new_spinner();
+    en_pb.set_style(
+        ProgressStyle::with_template("[{elapsed_precise}] enumerate {spinner} {msg}")
+            .unwrap()
+    );
+    en_pb.enable_steady_tick(std::time::Duration::from_millis(120));
+    en_pb.set_message(format!("starting (remaining plies = {})", rem_full));
+ 
+    let t_en = std::time::Instant::now();
     let buckets = enumerate_graph(initial, cards, Some(rem_full));
-
+    let en_elapsed = t_en.elapsed();
+ 
     let mut total = 0usize;
     for d in 0..=9 {
         let n = buckets.layers[d].len();
         total += n;
         eprintln!("[graph] depth {}: {}", d, n);
     }
-    eprintln!("[graph] total states enumerated: {}", total);
-
+    en_pb.finish_and_clear();
+    eprintln!("[graph] enumeration done: states={} elapsed_ms={}", total, en_elapsed.as_millis());
+ 
     // Sanity: depth 9 must be terminals
     if buckets.layers[9].is_empty() {
         return Err("Graph enumeration did not reach depth 9; cannot retrograde solve".into());
     }
+ 
+    // Retrograde exact solve (with per-depth progress bars)
+    let entries_by_depth = {
+        let mp = MultiProgress::new();
 
-    // Retrograde exact solve
-    let entries_by_depth = retrograde_solve(initial, cards, &buckets);
+        // Depth 9 progress
+        {
+            let total9 = buckets.layers[9].len() as u64;
+            let pb9 = mp.add(ProgressBar::new(total9));
+            pb9.set_style(
+                ProgressStyle::with_template("[{elapsed_precise}] retro d=9 {bar:40.cyan/blue} {pos}/{len}")
+                    .unwrap()
+                    .progress_chars("=>-")
+            );
+            // Build map with a per-item tick via a temporary collection
+            let (initial_a, initial_b) = extract_initial_hands(initial);
+            let computed9: Vec<(u128, RetroEntry)> = buckets.layers[9]
+                .par_iter()
+                .map(|(key, packed)| {
+                    let s = packed.to_state(initial_a, initial_b);
+                    debug_assert!(s.is_terminal(), "Non-terminal at depth 9 encountered");
+                    let mut v = score(&s);
+                    if s.next == Owner::B {
+                        v = -v;
+                    }
+                    pb9.inc(1);
+                    (*key, RetroEntry { value: v, best_move: None })
+                })
+                .collect();
+            pb9.finish_and_clear();
+
+            // Seed entries_by_depth with depth 9 content
+            let mut entries_by_depth: Vec<HbHashMap<u128, RetroEntry, FastHasher>> =
+                (0..10).map(|_| HbHashMap::with_hasher(FastHasher::default())).collect();
+            let mut map9: HbHashMap<u128, RetroEntry, FastHasher> = HbHashMap::with_hasher(FastHasher::default());
+            map9.reserve(computed9.len());
+            for (k, e) in computed9 {
+                map9.insert(k, e);
+            }
+            entries_by_depth[9] = map9;
+
+            // Depths 8..0 with progress bars
+            for d in (0..=8).rev() {
+                let layer_len = buckets.layers[d].len() as u64;
+                let pbd = mp.add(ProgressBar::new(layer_len));
+                pbd.set_style(
+                    ProgressStyle::with_template(&format!("[{{elapsed_precise}}] retro d={} {{bar:40.cyan/blue}} {{pos}}/{{len}}", d))
+                        .unwrap()
+                        .progress_chars("=>-")
+                );
+                let child_map = &entries_by_depth[d + 1];
+                let layer = &buckets.layers[d];
+                let (initial_a, initial_b) = extract_initial_hands(initial);
+
+                let computed: Vec<(u128, RetroEntry)> = layer
+                    .par_iter()
+                    .map(|(key, packed)| {
+                        let s = packed.to_state(initial_a, initial_b);
+                        let moves = s.legal_moves();
+                        if moves.is_empty() {
+                            let mut v = score(&s);
+                            if s.next == Owner::B {
+                                v = -v;
+                            }
+                            pbd.inc(1);
+                            return (*key, RetroEntry { value: v, best_move: None });
+                        }
+                        let mut best_val: Option<i8> = None;
+                        let mut best_mv: Option<crate::state::Move> = None;
+                        for mv in moves {
+                            if let Ok(ns) = apply_move(&s, cards, mv) {
+                                let ck = zobrist_key(&ns);
+                                let v = if let Some(child) = child_map.get(&ck) {
+                                    child.value
+                                } else {
+                                    // Fallback: should be rare; compute terminal-like
+                                    let mut tv = score(&ns);
+                                    if ns.next == Owner::B {
+                                        tv = -tv;
+                                    }
+                                    tv
+                                };
+                                match (s.next, best_val) {
+                                    (Owner::A, None) => { best_val = Some(v); best_mv = Some(mv); }
+                                    (Owner::A, Some(cur)) => {
+                                        if v > cur { best_val = Some(v); best_mv = Some(mv); }
+                                    }
+                                    (Owner::B, None) => { best_val = Some(v); best_mv = Some(mv); }
+                                    (Owner::B, Some(cur)) => {
+                                        if v < cur { best_val = Some(v); best_mv = Some(mv); }
+                                    }
+                                }
+                            }
+                        }
+                        pbd.inc(1);
+                        let val = best_val.unwrap_or_else(|| {
+                            let mut v = score(&s);
+                            if s.next == Owner::B {
+                                v = -v;
+                            }
+                            v
+                        });
+                        (*key, RetroEntry { value: val, best_move: best_mv })
+                    })
+                    .collect();
+
+                let mut map: HbHashMap<u128, RetroEntry, FastHasher> = HbHashMap::with_hasher(FastHasher::default());
+                map.reserve(computed.len());
+                for (k, e) in computed {
+                    map.insert(k, e);
+                }
+                entries_by_depth[d] = map;
+                pbd.finish_and_clear();
+            }
+
+            entries_by_depth
+        }
+    };
 
     // Root summary
     let root_key = zobrist_key(initial);
@@ -447,8 +575,8 @@ pub fn graph_precompute_export(
     } else {
         eprintln!("[graph] root not found in retrograde results (unexpected)");
     }
-
+ 
     // Future: integrate JSONL export using entries_by_depth values and best_moves.
-
+ 
     Ok(())
 }
