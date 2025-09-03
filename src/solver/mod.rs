@@ -16,7 +16,13 @@ pub use graph::graph_precompute_export;
 pub use crate::persist::ElementsMode;
 // New exports for high-throughput Graph mode
 pub use graph::{graph_precompute_export_with_sink, GraphExportOutcome};
-pub use graph_writer::{GraphJsonlSink, GraphSinkStats, PlainJsonlWriter, ZstdFramesJsonlWriter};
+pub use graph_writer::{
+    GraphJsonlSink,
+    GraphSinkStats,
+    PlainJsonlWriter,
+    ZstdFramesJsonlWriter,
+    AsyncZstdFramesJsonlWriter,
+};
  
 #[derive(Debug, Clone, Copy)]
 pub struct SearchLimits {

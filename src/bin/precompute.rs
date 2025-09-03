@@ -240,6 +240,18 @@ struct Args {
     /// Sync policy for graph export files: none | final (default: final)
     #[arg(long = "sync-mode", value_enum, default_value_t = SyncModeOpt::Final)]
     sync_mode: SyncModeOpt,
+
+    /// Max in-flight frames in writer queue (default: 8)
+    #[arg(long = "writer-queue-frames", default_value_t = 8)]
+    writer_queue_frames: usize,
+
+    /// Async compression workers for stage-1 (0 = compress in writer thread; default: 2)
+    #[arg(long = "zstd-workers", default_value_t = 2)]
+    zstd_workers: usize,
+
+    /// Bounded queue size for compressed frames handed to the writer (default: 4)
+    #[arg(long = "writer-queue-compressed", default_value_t = 4)]
+    writer_queue_compressed: usize,
 }
 
 fn parse_rules(s: &str) -> Rules {
@@ -2217,14 +2229,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let frame_bytes = args.zstd_frame_bytes;
 
             let mut sink_box: Box<dyn triplecargo::solver::GraphJsonlSink> = if zstd_enabled {
-                Box::new(triplecargo::solver::ZstdFramesJsonlWriter::new(
+                Box::new(triplecargo::solver::AsyncZstdFramesJsonlWriter::new(
                     nodes_file,
                     idx_file_opt,
-                    buf_cap,            // nodes BufWriter capacity (32 MiB)
+                    buf_cap,            // BufWriter capacity (32 MiB)
                     zstd_level,
                     zstd_threads,
                     frame_lines,
-                    frame_bytes,        // frame max bytes (soft cap)
+                    frame_bytes,                       // frame max bytes (soft cap)
+                    args.writer_queue_frames,          // raw frames queue
+                    args.zstd_workers,                 // compression workers (0 = single-stage)
+                    args.writer_queue_compressed,      // compressed frames queue
                     sync_final,
                 ))
             } else {
