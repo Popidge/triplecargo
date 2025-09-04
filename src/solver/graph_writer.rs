@@ -684,3 +684,260 @@ impl GraphJsonlSink for AsyncZstdFramesJsonlWriter {
         })
     }
 }
+//
+// Async sharded ZSTD frames writer (single-coordinator implementation)
+//
+// Coordinator receives completed Frames from the producer and deterministically
+// assigns them to shards (shard = frame_id % shards). The coordinator compresses
+// each frame, writes the compressed bytes to the corresponding per-shard
+// nodes_{NNN}.jsonl.zst BufWriter, updates per-shard compressed offsets, hashes
+// per-shard bytes for per-file integrity, and emits a single shared index line
+// into nodes.idx.jsonl containing the shard and byte_offset for that frame.
+//
+// This single-coordinator design preserves deterministic ordering of index
+// emission and keeps implementation simple and crash-safe.
+#[derive(Debug)]
+struct ShardedWriterOutcome {
+    total_lines: u64,
+    frame_count: u64,
+    nodes_sha256_list: Vec<String>, // per-shard digests (hex), in shard order
+    index_sha256_hex: Option<String>,
+}
+
+pub struct AsyncShardedZstdFramesJsonlWriter {
+    // producer-side frame builder (same shape as AsyncZstdFramesJsonlWriter)
+    frame_buf: Vec<u8>,
+    frame_lines_target: usize,
+    frame_max_bytes: usize,
+    frame_lines_count: usize,
+    cur_turn_min: Option<u8>,
+    cur_turn_max: Option<u8>,
+    next_frame_id: u64,
+    global_line_cursor: u64,
+
+    // channel to coordinator
+    tx: Sender<FrameMsg>,
+
+    // join handle for the coordinator
+    writer_join: Option<thread::JoinHandle<io::Result<ShardedWriterOutcome>>>,
+
+    // shard count and final fsync policy (retained for coordinator use)
+    shards: usize,
+    sync_final: bool,
+}
+
+impl AsyncShardedZstdFramesJsonlWriter {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        shard_files: Vec<File>, // length == shards
+        idx_file: Option<File>, // shared index file (nodes.idx.jsonl)
+        buf_bytes: usize,
+        zstd_level: i32,
+        zstd_threads: usize,
+        frame_lines_target: usize,
+        frame_max_bytes: usize,
+        writer_queue_frames: usize,
+        sync_final: bool,
+    ) -> Self {
+        let shards = shard_files.len().max(1);
+        let (tx, rx) = bounded::<FrameMsg>(writer_queue_frames.max(1));
+
+        // Spawn coordinator thread
+        let join = thread::spawn(move || -> io::Result<ShardedWriterOutcome> {
+            // Prepare per-shard writers, hashers and pos counters
+            let mut nodes_writers: Vec<BufWriter<File>> = shard_files
+                .into_iter()
+                .map(|f| BufWriter::with_capacity(buf_bytes.max(8 * 1024 * 1024), f))
+                .collect();
+
+            let mut hasher_nodes: Vec<Sha256> = vec![Sha256::new(); shards];
+            let mut compressed_pos: Vec<u64> = vec![0u64; shards];
+
+            // Shared index writer + hasher
+            let mut idx_writer = idx_file.map(|f| BufWriter::with_capacity(buf_bytes.max(1024 * 1024), f));
+            let mut hasher_idx = idx_writer.as_ref().map(|_| Sha256::new());
+
+            let mut total_lines: u64 = 0;
+            let mut frame_count: u64 = 0;
+
+            while let Ok(msg) = rx.recv() {
+                match msg {
+                    FrameMsg::Data(f) => {
+                        let shard = (f.id as usize) % shards;
+                        let offset = compressed_pos[shard];
+
+                        // Compress frame into corresponding shard writer while hashing and counting
+                        {
+                            let mut counting_writer = HashingFileWrite {
+                                inner: &mut nodes_writers[shard],
+                                hasher: &mut hasher_nodes[shard],
+                                pos: &mut compressed_pos[shard],
+                            };
+                            let mut encoder = zstd::stream::write::Encoder::new(&mut counting_writer, zstd_level)?;
+                            let _ = encoder.multithread(zstd_threads.max(1) as u32);
+                            encoder.write_all(&f.uncompressed)?;
+                            let _ = encoder.finish();
+                        }
+
+                        // Emit one index line to shared index with shard field and global frame id
+                        if let (Some(idxw), Some(h)) = (idx_writer.as_mut(), hasher_idx.as_mut()) {
+                            let line = serde_json::json!({
+                                "frame": f.id,
+                                "shard": shard,
+                                "line_start": f.line_start,
+                                "byte_offset": offset,
+                                "lines": f.line_count as u64,
+                                "turn_min": f.turn_min,
+                                "turn_max": f.turn_max
+                            });
+                            let mut tmp = serde_json::to_vec(&line).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                            tmp.push(b'\n');
+                            idxw.write_all(&tmp)?;
+                            h.update(&tmp);
+                        }
+
+                        frame_count = frame_count.saturating_add(1);
+                        total_lines = total_lines.saturating_add(f.line_count as u64);
+                    }
+                    FrameMsg::End => break,
+                }
+            }
+
+            // Final flushes
+            for w in nodes_writers.iter_mut() {
+                w.flush()?;
+            }
+            if let Some(iw) = idx_writer.as_mut() {
+                iw.flush()?;
+            }
+
+            if sync_final {
+                // fsync all files
+                for w in nodes_writers.iter() {
+                    w.get_ref().sync_all()?;
+                }
+                if let Some(iw) = idx_writer.as_ref() {
+                    iw.get_ref().sync_all()?;
+                }
+            }
+
+            // Finalize per-shard digests
+            let nodes_sha256_list: Vec<String> = hasher_nodes
+                .into_iter()
+                .map(|h| hex::encode(h.finalize()))
+                .collect();
+
+            let index_sha = hasher_idx.map(|h| hex::encode(h.finalize()));
+
+            Ok(ShardedWriterOutcome {
+                total_lines,
+                frame_count,
+                nodes_sha256_list,
+                index_sha256_hex: index_sha,
+            })
+        });
+
+        Self {
+            frame_buf: Vec::with_capacity(frame_max_bytes.max(128 * 1024 * 1024)),
+            frame_lines_target: frame_lines_target.max(1),
+            frame_max_bytes: frame_max_bytes.max(1 * 1024 * 1024),
+            frame_lines_count: 0,
+            cur_turn_min: None,
+            cur_turn_max: None,
+            next_frame_id: 0,
+            global_line_cursor: 0,
+            tx,
+            writer_join: Some(join),
+            shards,
+            sync_final,
+        }
+    }
+
+    fn emit_frame(&mut self) -> io::Result<()> {
+        if self.frame_lines_count == 0 {
+            return Ok(());
+        }
+        let turn_min = self.cur_turn_min.unwrap_or(0);
+        let turn_max = self.cur_turn_max.unwrap_or(turn_min);
+        let line_start = self.global_line_cursor;
+        let line_count_u32 = self.frame_lines_count as u32;
+
+        let buf = std::mem::replace(
+            &mut self.frame_buf,
+            Vec::with_capacity(self.frame_max_bytes.max(128 * 1024 * 1024)),
+        );
+
+        let frame = Frame {
+            id: self.next_frame_id,
+            uncompressed: buf,
+            turn_min,
+            turn_max,
+            line_start,
+            line_count: line_count_u32,
+        };
+
+        self.next_frame_id = self.next_frame_id.saturating_add(1);
+        self.global_line_cursor = self.global_line_cursor.saturating_add(self.frame_lines_count as u64);
+        self.frame_lines_count = 0;
+        self.cur_turn_min = None;
+        self.cur_turn_max = None;
+
+        self.tx
+            .send(FrameMsg::Data(frame))
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "sharded writer channel closed"))
+    }
+}
+
+impl GraphJsonlSink for AsyncShardedZstdFramesJsonlWriter {
+    fn write_line(&mut self, json_line: &[u8], turn: u8) -> io::Result<()> {
+        self.frame_buf.extend_from_slice(json_line);
+        self.frame_buf.push(b'\n');
+
+        self.frame_lines_count = self.frame_lines_count.saturating_add(1);
+        match (self.cur_turn_min, self.cur_turn_max) {
+            (None, None) => {
+                self.cur_turn_min = Some(turn);
+                self.cur_turn_max = Some(turn);
+            }
+            (Some(lo), Some(hi)) => {
+                if turn < lo {
+                    self.cur_turn_min = Some(turn);
+                }
+                if turn > hi {
+                    self.cur_turn_max = Some(turn);
+                }
+            }
+            _ => {
+                self.cur_turn_min = Some(turn);
+                self.cur_turn_max = Some(turn);
+            }
+        }
+
+        if self.frame_lines_count >= self.frame_lines_target || self.frame_buf.len() >= self.frame_max_bytes {
+            self.emit_frame()?;
+        }
+        Ok(())
+    }
+
+    fn finish_mut(&mut self) -> io::Result<GraphSinkStats> {
+        // Flush any pending frame
+        self.emit_frame()?;
+
+        // signal end
+        self.tx
+            .send(FrameMsg::End)
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "sharded writer channel closed"))?;
+
+        // join coordinator
+        let handle = self.writer_join.take().expect("sharded writer join present");
+        let outcome = handle.join().map_err(|_| io::Error::new(io::ErrorKind::Other, "sharded writer thread panicked"))??;
+
+        Ok(GraphSinkStats {
+            total_lines: outcome.total_lines,
+            frame_count: outcome.frame_count,
+            nodes_sha256_hex: String::new(),
+            index_sha256_hex: outcome.index_sha256_hex,
+            nodes_sha256_list: Some(outcome.nodes_sha256_list),
+        })
+    }
+}

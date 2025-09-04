@@ -252,6 +252,10 @@ struct Args {
     /// Bounded queue size for compressed frames handed to the writer (default: 4)
     #[arg(long = "writer-queue-compressed", default_value_t = 4)]
     writer_queue_compressed: usize,
+
+    /// Number of shard output files (1 = no sharding). When >1 nodes files will be nodes_000.jsonl.zst ... nodes_{N-1}.jsonl.zst
+    #[arg(long = "shards", default_value_t = 1)]
+    shards: usize,
 }
 
 fn parse_rules(s: &str) -> Rules {
@@ -2227,8 +2231,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let sync_final = matches!(args.sync_mode, SyncModeOpt::Final);
             let buf_cap = triplecargo::solver::graph_writer::BUF_WRITER_CAP_BYTES;
             let frame_bytes = args.zstd_frame_bytes;
-
-            let mut sink_box: Box<dyn triplecargo::solver::GraphJsonlSink> = if zstd_enabled {
+            
+            // Track whether we created sharded node outputs and their names for manifest building
+            let mut nodes_sharded: bool = false;
+            let mut nodes_shard_names: Vec<String> = Vec::new();
+            
+            let mut sink_box: Box<dyn triplecargo::solver::GraphJsonlSink> = if zstd_enabled && args.shards > 1 {
+                // Create per-shard node files nodes_000.jsonl.zst ... nodes_{N-1}.jsonl.zst
+                let shards = args.shards;
+                let mut shard_files: Vec<File> = Vec::with_capacity(shards);
+                for i in 0..shards {
+                    let name = format!("nodes_{:03}.jsonl.zst", i);
+                    let path = export_dir.join(&name);
+                    let f = File::create(&path).map_err(|e| format!("create shard nodes file {} error: {e}", path.display()))?;
+                    shard_files.push(f);
+                    nodes_shard_names.push(name);
+                }
+                nodes_sharded = true;
+                // Shared index file (if enabled) is already prepared in idx_file_opt
+                Box::new(triplecargo::solver::AsyncShardedZstdFramesJsonlWriter::new(
+                    shard_files,
+                    idx_file_opt,
+                    buf_cap,            // BufWriter capacity (32 MiB)
+                    zstd_level,
+                    zstd_threads,
+                    frame_lines,
+                    frame_bytes,        // frame max bytes (soft cap)
+                    args.writer_queue_frames, // raw frames queue
+                    sync_final,
+                ))
+            } else if zstd_enabled {
+                // Single-file zstd writer (non-sharded)
                 Box::new(triplecargo::solver::AsyncZstdFramesJsonlWriter::new(
                     nodes_file,
                     idx_file_opt,
@@ -2313,16 +2346,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 })
             };
 
-            let files_obj = serde_json::json!({
-                "nodes": final_nodes_name,
-                "index": final_index_name,
-                "manifest": manifest_name,
-            });
-
-            let integrity_obj = serde_json::json!({
-                "nodes_sha256": stats.nodes_sha256_hex,
-                "index_sha256": stats.index_sha256_hex,
-            });
+            // Files listing: use shard array when sharded, otherwise single filename
+            let files_obj = if nodes_sharded {
+                serde_json::json!({
+                    "nodes": nodes_shard_names,
+                    "index": final_index_name,
+                    "manifest": manifest_name,
+                })
+            } else {
+                serde_json::json!({
+                    "nodes": final_nodes_name,
+                    "index": final_index_name,
+                    "manifest": manifest_name,
+                })
+            };
+            
+            // Integrity: when sharded, include per-shard node digests; otherwise single nodes digest
+            let integrity_obj = if nodes_sharded {
+                serde_json::json!({
+                    "nodes_sha256_list": stats.nodes_sha256_list.clone().unwrap_or_default(),
+                    "index_sha256": stats.index_sha256_hex,
+                })
+            } else {
+                serde_json::json!({
+                    "nodes_sha256": stats.nodes_sha256_hex,
+                    "index_sha256": stats.index_sha256_hex,
+                })
+            };
 
             let totals_obj = serde_json::json!({
                 "states": outcome.totals_states,

@@ -22,6 +22,7 @@ pub use graph_writer::{
     PlainJsonlWriter,
     ZstdFramesJsonlWriter,
     AsyncZstdFramesJsonlWriter,
+    AsyncShardedZstdFramesJsonlWriter,
 };
  
 #[derive(Debug, Clone, Copy)]
