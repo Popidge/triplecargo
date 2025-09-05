@@ -520,7 +520,7 @@ fn retrograde_solve(
 /// - Validate full-depth requirement
 /// - Enumerate graph to ply 9
 /// - Retrograde exact solve 9 -> 0
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 struct ExportBoardCell {
     cell: u8,
     #[serde(skip_serializing_if = "Option::is_none")]
