@@ -43,3 +43,4 @@ path = "src/bin/query.rs"
 [features]
 default = []
 mmap = ["memmap2"]
+fast_tests = []
