@@ -2259,6 +2259,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     frame_bytes,        // frame max bytes (soft cap)
                     args.writer_queue_frames, // raw frames queue
                     sync_final,
+                    zstd_enabled,
                 ))
             } else if zstd_enabled {
                 // Single-file zstd writer (non-sharded)
@@ -2274,12 +2275,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     args.zstd_workers,                 // compression workers (0 = single-stage)
                     args.writer_queue_compressed,      // compressed frames queue
                     sync_final,
+                    zstd_enabled,
                 ))
             } else {
                 Box::new(triplecargo::solver::PlainJsonlWriter::new(
                     nodes_file,
                     buf_cap,
                     sync_final,
+                    zstd_enabled,
                 ))
             };
 
@@ -2306,6 +2309,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         plain_nodes_file,
                         buf_cap,
                         sync_final,
+                        zstd_enabled,
                     );
                     let outcome2 = triplecargo::solver::graph_precompute_export_with_sink(&initial, &cards, args.max_depth, &mut plain_sink)
                         .map_err(|e| format!("graph export retry (plain) error: {e}"))?;

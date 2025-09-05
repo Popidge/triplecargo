@@ -255,6 +255,61 @@ fn extract_initial_hands(initial: &GameState) -> ([u16; 5], [u16; 5]) {
     }
     (a, b)
 }
+/// Fast, allocation-light hands reconstruction from a PackedState board and the sorted initial hands.
+///
+/// - `initial_a` and `initial_b` are expected to be pre-sorted ascending and contain zeros for empty slots.
+/// - For each placed card on the `board` (iterating cells 0..8) we attempt to remove one matching id
+///   from A; if none remains in A, we remove one from B. This mirrors the semantics used by `to_state`
+///   but avoids HashMap allocations and zobrist recomputation.
+/// - Complexity: O(9*5) worst-case, deterministic for duplicated ids (A is preferred).
+#[inline]
+pub fn fast_hands_from_board(board: &Board, initial_a: [u16; 5], initial_b: [u16; 5]) -> (Vec<u16>, Vec<u16>) {
+    // Make mutable local copies of the small fixed arrays
+    let mut a = initial_a;
+    let mut b = initial_b;
+
+    // For each occupied cell, remove one matching id from A first, then B.
+    for cell in 0u8..9 {
+        if let Some(slot) = board.get(cell) {
+            let id = slot.card_id;
+            // Try remove from A
+            let mut removed = false;
+            for ai in 0..5 {
+                if a[ai] == id {
+                    a[ai] = 0;
+                    removed = true;
+                    break;
+                }
+            }
+            if removed {
+                continue;
+            }
+            // Try remove from B
+            for bi in 0..5 {
+                if b[bi] == id {
+                    b[bi] = 0;
+                    break;
+                }
+            }
+        }
+    }
+
+    // Collect remaining non-zero ids preserving ascending order
+    let mut ra: Vec<u16> = Vec::with_capacity(5);
+    let mut rb: Vec<u16> = Vec::with_capacity(5);
+    for &v in &a {
+        if v != 0 {
+            ra.push(v);
+        }
+    }
+    for &v in &b {
+        if v != 0 {
+            rb.push(v);
+        }
+    }
+
+    (ra, rb)
+}
 
 /// Phase B: exact retrograde solve, assuming full-depth enumeration to ply 9.
 /// Returns per-depth hashmaps of (zobrist -> RetroEntry) for depths 0..9.
@@ -647,75 +702,55 @@ pub fn graph_precompute_export(
         let layer = &buckets.layers[d];
         let map = &entries_by_depth[d];
         for (key, packed) in layer {
-            let state = packed.to_state(initial_a, initial_b);
+            // Reconstruct hands quickly from the packed board and the initial sorted hands.
+            let (ha, hb) = fast_hands_from_board(&packed.board, initial_a, initial_b);
 
-            // Hands snapshot vectors (compact ascending)
-            let mut ha: Vec<u16> = Vec::with_capacity(5);
-            let mut hb: Vec<u16> = Vec::with_capacity(5);
-            for &o in state.hands_a.iter() {
-                if let Some(id) = o {
-                    ha.push(id);
-                }
-            }
-            for &o in state.hands_b.iter() {
-                if let Some(id) = o {
-                    hb.push(id);
-                }
-            }
-
-            // Board cells
+            // Board cells (use PackedState fields directly; avoid creating a full GameState)
             let mut board_vec: Vec<ExportBoardCell> = Vec::with_capacity(9);
-            let elemental_enabled = state.rules.elemental;
+            let elemental_enabled = packed.rules.elemental;
             for cell in 0u8..9 {
-                let slot = state.board.get(cell);
+                let slot = packed.board.get(cell);
                 let (card_id, owner) = match slot {
                     Some(s) => (Some(s.card_id), Some(match s.owner { Owner::A => 'A', Owner::B => 'B' })),
                     None => (None, None),
                 };
                 let element_field: Option<Option<char>> = if elemental_enabled {
-                    Some(state.board.cell_element(cell).map(element_letter_local))
+                    Some(packed.board.cell_element(cell).map(element_letter_local))
                 } else {
                     None
                 };
                 board_vec.push(ExportBoardCell { cell, card_id, owner, element: element_field });
             }
 
-            // to_move
-            let to_move = match state.next { Owner::A => 'A', Owner::B => 'B' };
+            // to_move and turn/state_idx come from PackedState / layer depth
+            let to_move = match packed.next { Owner::A => 'A', Owner::B => 'B' };
 
-            // Lookup retrograde entry for this state
-            let entry = match map.get(key) {
-                Some(e) => *e,
-                None => {
-                    // Should not happen; skip or compute fallback
-                    let mut v = score(&state);
-                    if state.next == Owner::B {
-                        v = -v;
-                    }
-                    RetroEntry { value: v, best_move: None }
-                }
-            };
+            // Lookup retrograde entry for this state (should be present)
+            let entry = map.get(key).copied().unwrap_or(RetroEntry { value: 0, best_move: None });
 
-            // policy_target: best_move when non-terminal
-            let policy_target = if !state.is_terminal() {
+            // policy_target present only when d < 9 (non-terminal)
+            let policy_target = if d < 9 {
                 entry.best_move.map(|m| ExportPolicy::Move { card_id: m.card_id, cell: m.cell })
             } else {
                 None
             };
 
+            let vt = if entry.value > 0 { 1 } else if entry.value < 0 { -1 } else { 0 };
+
             let line = ExportLine {
                 game_id: 0,
-                state_idx: state.board.filled_count(),
+                state_idx: d as u8,
                 board: board_vec,
                 hands: ExportHands { a: ha, b: hb },
                 to_move,
-                turn: state.board.filled_count(),
-                rules: state.rules,
+                turn: d as u8,
+                rules: packed.rules,
                 policy_target,
-                value_target: if entry.value > 0 { 1 } else if entry.value < 0 { -1 } else { 0 },
+                value_target: vt,
                 value_mode: "winloss".to_string(),
                 off_pv: false,
-                state_hash: format!("{:032x}", zobrist_key(&state)),
+                // Use the u128 key paired with the PackedState as the state_hash (no recompute)
+                state_hash: format!("{:032x}", key),
             };
 
             let s = serde_json::to_string(&line)?;
@@ -931,89 +966,74 @@ pub fn graph_precompute_export_with_sink(
     let mut lines_written: usize = 0;
     let mut hasher = Sha256::new();
 
+    // Throttle progress bar increments to reduce per-line overhead
+    const PB_THROTTLE: u64 = 16_384;
+    let mut write_pb_pending: u64 = 0;
     for d in 0..=9 {
         let layer = &buckets.layers[d];
         let map = &entries_by_depth[d];
         for (key, packed) in layer {
-            let state = packed.to_state(initial_a, initial_b);
-
-            // Hands snapshot vectors (compact ascending)
-            let mut ha: Vec<u16> = Vec::with_capacity(5);
-            let mut hb: Vec<u16> = Vec::with_capacity(5);
-            for &o in state.hands_a.iter() {
-                if let Some(id) = o {
-                    ha.push(id);
-                }
-            }
-            for &o in state.hands_b.iter() {
-                if let Some(id) = o {
-                    hb.push(id);
-                }
-            }
-
-            // Board cells
+            // Fast hands reconstruction from PackedState board + initial hands
+            let (ha, hb) = fast_hands_from_board(&packed.board, initial_a, initial_b);
+    
+            // Board cells (use PackedState fields directly; avoid creating a full GameState)
             let mut board_vec: Vec<ExportBoardCell> = Vec::with_capacity(9);
-            let elemental_enabled = state.rules.elemental;
+            let elemental_enabled = packed.rules.elemental;
             for cell in 0u8..9 {
-                let slot = state.board.get(cell);
+                let slot = packed.board.get(cell);
                 let (card_id, owner) = match slot {
                     Some(s) => (Some(s.card_id), Some(match s.owner { Owner::A => 'A', Owner::B => 'B' })),
                     None => (None, None),
                 };
                 let element_field: Option<Option<char>> = if elemental_enabled {
-                    Some(state.board.cell_element(cell).map(element_letter_local))
+                    Some(packed.board.cell_element(cell).map(element_letter_local))
                 } else {
                     None
                 };
                 board_vec.push(ExportBoardCell { cell, card_id, owner, element: element_field });
             }
-
-            // to_move
-            let to_move = match state.next { Owner::A => 'A', Owner::B => 'B' };
-
-            // Lookup retrograde entry for this state
-            let entry = match map.get(key) {
-                Some(e) => *e,
-                None => {
-                    // Should not happen; fallback to terminal-like
-                    let mut v = score(&state);
-                    if state.next == Owner::B {
-                        v = -v;
-                    }
-                    RetroEntry { value: v, best_move: None }
-                }
-            };
-
-            // policy_target: best_move when non-terminal
-            let policy_target = if !state.is_terminal() {
+    
+            // to_move and turn/state_idx come from PackedState / layer depth
+            let to_move = match packed.next { Owner::A => 'A', Owner::B => 'B' };
+    
+            // Lookup retrograde entry for this state (use default fallback if missing)
+            let entry = map.get(key).copied().unwrap_or(RetroEntry { value: 0, best_move: None });
+    
+            // policy_target present only when d < 9 (non-terminal)
+            let policy_target = if d < 9 {
                 entry.best_move.map(|m| ExportPolicy::Move { card_id: m.card_id, cell: m.cell })
             } else {
                 None
             };
-
+    
             let vt = if entry.value > 0 { 1 } else if entry.value < 0 { -1 } else { 0 };
-
+    
             let line = ExportLine {
                 game_id: 0,
-                state_idx: state.board.filled_count(),
+                state_idx: d as u8,
                 board: board_vec,
                 hands: ExportHands { a: ha, b: hb },
                 to_move,
-                turn: state.board.filled_count(),
-                rules: state.rules,
+                turn: d as u8,
+                rules: packed.rules,
                 policy_target,
                 value_target: vt,
                 value_mode: "winloss".to_string(),
                 off_pv: false,
-                state_hash: format!("{:032x}", zobrist_key(&state)),
+                // Use the u128 key paired with the PackedState as the state_hash (no recompute)
+                state_hash: format!("{:032x}", key),
             };
-
+    
             // Serialize and write via sink
             let s = serde_json::to_vec(&line)?;
-            sink.write_line(&s, state.board.filled_count())?;
-            write_pb.inc(1);
+            sink.write_line(&s, d as u8)?;
+            write_pb_pending = write_pb_pending.saturating_add(1);
+            if write_pb_pending >= PB_THROTTLE {
+                write_pb.inc(write_pb_pending);
+                write_pb_pending = 0;
+            }
             lines_written += 1;
-
+    
             // Logical checksum update: (state_hash|value|best_move or -)
             let bm_str = match entry.best_move {
                 Some(m) => format!("{}-{}", m.card_id, m.cell),
@@ -1023,12 +1043,15 @@ pub fn graph_precompute_export_with_sink(
             hasher.update(tuple.as_bytes());
         }
     }
- 
+    // Flush any pending progress increments
+    if write_pb_pending > 0 {
+        write_pb.inc(write_pb_pending);
+    }
     write_pb.finish_and_clear();
     eprintln!("[graph] export lines written: {}", lines_written);
- 
+    
     let logical_checksum_hex = hex::encode(hasher.finalize());
-
+    
     Ok(GraphExportOutcome {
         totals_by_depth,
         totals_states,

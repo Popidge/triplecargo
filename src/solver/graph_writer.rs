@@ -13,7 +13,8 @@ pub const BUF_WRITER_CAP_BYTES: usize = 32 * 1024 * 1024;
 pub struct GraphSinkStats {
     pub total_lines: u64,
     pub frame_count: u64,
-    pub nodes_sha256_hex: String,
+    // When hashing is enabled this will contain the hex digest; when disabled it will be None.
+    pub nodes_sha256_hex: Option<String>,
     pub index_sha256_hex: Option<String>,
     // When sharding is used, provide per-shard node file digests (in shard index order).
     pub nodes_sha256_list: Option<Vec<String>>,
@@ -30,15 +31,17 @@ pub struct PlainJsonlWriter {
     hasher_nodes: Sha256,
     total_lines: u64,
     sync_final: bool,
+    hashing: bool,
 }
 
 impl PlainJsonlWriter {
-    pub fn new(nodes_file: File, buf_bytes: usize, sync_final: bool) -> Self {
+    pub fn new(nodes_file: File, buf_bytes: usize, sync_final: bool, hashing: bool) -> Self {
         Self {
             nodes: BufWriter::with_capacity(buf_bytes.max(1024 * 1024), nodes_file),
             hasher_nodes: Sha256::new(),
             total_lines: 0,
             sync_final,
+            hashing,
         }
     }
 }
@@ -47,8 +50,10 @@ impl GraphJsonlSink for PlainJsonlWriter {
     fn write_line(&mut self, json_line: &[u8], _turn: u8) -> io::Result<()> {
         self.nodes.write_all(json_line)?;
         self.nodes.write_all(b"\n")?;
-        self.hasher_nodes.update(json_line);
-        self.hasher_nodes.update(b"\n");
+        if self.hashing {
+            self.hasher_nodes.update(json_line);
+            self.hasher_nodes.update(b"\n");
+        }
         self.total_lines = self.total_lines.saturating_add(1);
         Ok(())
     }
@@ -61,11 +66,16 @@ impl GraphJsonlSink for PlainJsonlWriter {
             // Safe: BufWriter holds a File
             self.nodes.get_ref().sync_all()?;
         }
-        let digest = std::mem::take(&mut self.hasher_nodes).finalize();
+        let nodes_sha = if self.hashing {
+            let digest = std::mem::take(&mut self.hasher_nodes).finalize();
+            Some(hex::encode(digest))
+        } else {
+            None
+        };
         Ok(GraphSinkStats {
             total_lines: self.total_lines,
             frame_count: 0,
-            nodes_sha256_hex: hex::encode(digest),
+            nodes_sha256_hex: nodes_sha,
             index_sha256_hex: None,
             nodes_sha256_list: None,
         })
@@ -79,12 +89,15 @@ struct HashingFileWrite<'a> {
     inner: &'a mut BufWriter<File>,
     hasher: &'a mut Sha256,
     pos: &'a mut u64,
+    hashing: bool,
 }
 
 impl<'a> Write for HashingFileWrite<'a> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let n = self.inner.write(buf)?;
-        self.hasher.update(&buf[..n]);
+        if self.hashing {
+            self.hasher.update(&buf[..n]);
+        }
         *self.pos = (*self.pos).saturating_add(n as u64);
         Ok(n)
     }
@@ -97,34 +110,37 @@ impl<'a> Write for HashingFileWrite<'a> {
 pub struct ZstdFramesJsonlWriter {
     nodes: BufWriter<File>,
     idx: Option<BufWriter<File>>,
-
+ 
     hasher_nodes: Sha256,
     hasher_idx: Option<Sha256>,
-
+ 
     // Tracks total compressed bytes written so far (for index offsets).
     compressed_pos: u64,
-
+ 
     // Accumulator for one frame worth of JSONL (uncompressed)
     frame_buf: Vec<u8>,
     frame_lines_target: usize,
     frame_max_bytes: usize,
     frame_lines_count: usize,
-
+ 
     // Running counters
     total_lines: u64,
     frame_count: u64,
     global_line_cursor: u64, // next line number to assign as line_start for a new frame
-
+ 
     // Per-frame stats
     cur_turn_min: Option<u8>,
     cur_turn_max: Option<u8>,
-
+ 
     // Compression config
     zstd_level: i32,
     zstd_threads: usize,
-
+ 
     // Final fsync policy
     sync_final: bool,
+ 
+    // Whether to compute/emit SHA256 digests
+    hashing: bool,
 }
 
 impl ZstdFramesJsonlWriter {
@@ -137,6 +153,7 @@ impl ZstdFramesJsonlWriter {
         frame_lines_target: usize,
         frame_max_bytes: usize,
         sync_final: bool,
+        hashing: bool,
     ) -> Self {
         let idx = idx_file.map(|f| BufWriter::with_capacity(buf_bytes.max(1024 * 1024), f));
         let hasher_idx = idx.as_ref().map(|_| Sha256::new());
@@ -159,6 +176,7 @@ impl ZstdFramesJsonlWriter {
             zstd_level,
             zstd_threads: zstd_threads.max(1),
             sync_final,
+            hashing,
         }
     }
 
@@ -177,6 +195,7 @@ impl ZstdFramesJsonlWriter {
                 inner: &mut self.nodes,
                 hasher: &mut self.hasher_nodes,
                 pos: &mut self.compressed_pos,
+                hashing: self.hashing,
             };
             let mut encoder =
                 zstd::stream::write::Encoder::new(&mut hashing_writer, self.zstd_level)?;
@@ -206,7 +225,9 @@ impl ZstdFramesJsonlWriter {
                 serde_json::to_vec(&line).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
             tmp.push(b'\n');
             idx.write_all(&tmp)?;
-            h.update(&tmp);
+            if self.hashing {
+                h.update(&tmp);
+            }
         }
 
         self.frame_count = self.frame_count.saturating_add(1);
@@ -278,11 +299,11 @@ impl GraphJsonlSink for ZstdFramesJsonlWriter {
 
         let nodes_digest = std::mem::take(&mut self.hasher_nodes).finalize();
         let index_digest = self.hasher_idx.take().map(|h| hex::encode(h.finalize()));
-
+    
         Ok(GraphSinkStats {
             total_lines: self.total_lines,
             frame_count: self.frame_count,
-            nodes_sha256_hex: hex::encode(nodes_digest),
+            nodes_sha256_hex: Some(hex::encode(nodes_digest)),
             index_sha256_hex: index_digest,
             nodes_sha256_list: None,
         })
@@ -352,6 +373,8 @@ pub struct AsyncZstdFramesJsonlWriter {
 
     // number of compression workers (0 = single-stage)
     workers: usize,
+    // whether to compute/emit SHA digests
+    hashing: bool,
 }
 
 impl AsyncZstdFramesJsonlWriter {
@@ -368,6 +391,7 @@ impl AsyncZstdFramesJsonlWriter {
         zstd_workers: usize,
         writer_queue_compressed: usize,
         sync_final: bool,
+        hashing: bool,
     ) -> Self {
         let workers = zstd_workers;
         let (tx, raw_rx) = bounded::<FrameMsg>(writer_queue_frames.max(1));
@@ -382,6 +406,7 @@ impl AsyncZstdFramesJsonlWriter {
                 let mut compressed_pos: u64 = 0;
                 let mut total_lines: u64 = 0;
                 let mut frame_count: u64 = 0;
+                let hashing_local = hashing;
 
                 while let Ok(msg) = raw_rx.recv() {
                     match msg {
@@ -392,6 +417,7 @@ impl AsyncZstdFramesJsonlWriter {
                                     inner: &mut nodes,
                                     hasher: &mut hasher_nodes,
                                     pos: &mut compressed_pos,
+                                    hashing: hashing_local,
                                 };
                                 let mut encoder = zstd::stream::write::Encoder::new(&mut counting_writer, zstd_level)?;
                                 let _ = encoder.multithread(zstd_threads.max(1) as u32);
@@ -410,7 +436,9 @@ impl AsyncZstdFramesJsonlWriter {
                                 let mut tmp = serde_json::to_vec(&line).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
                                 tmp.push(b'\n');
                                 idxw.write_all(&tmp)?;
-                                h.update(&tmp);
+                                if hashing_local {
+                                    h.update(&tmp);
+                                }
                             }
                             frame_count = frame_count.saturating_add(1);
                             total_lines = total_lines.saturating_add(f.line_count as u64);
@@ -453,6 +481,7 @@ impl AsyncZstdFramesJsonlWriter {
                 writer_join: Some(join),
                 comp_joins: Vec::new(),
                 workers,
+                hashing,
             }
         } else {
             // Two-stage path: compression pool -> single writer
@@ -581,6 +610,7 @@ impl AsyncZstdFramesJsonlWriter {
                 writer_join: Some(join),
                 comp_joins,
                 workers,
+                hashing,
             }
         }
     }
@@ -678,7 +708,7 @@ impl GraphJsonlSink for AsyncZstdFramesJsonlWriter {
         Ok(GraphSinkStats {
             total_lines: outcome.total_lines,
             frame_count: outcome.frame_count,
-            nodes_sha256_hex: outcome.nodes_sha256_hex,
+            nodes_sha256_hex: Some(outcome.nodes_sha256_hex),
             index_sha256_hex: outcome.index_sha256_hex,
             nodes_sha256_list: None,
         })
@@ -714,16 +744,17 @@ pub struct AsyncShardedZstdFramesJsonlWriter {
     cur_turn_max: Option<u8>,
     next_frame_id: u64,
     global_line_cursor: u64,
-
+ 
     // channel to coordinator
     tx: Sender<FrameMsg>,
-
+ 
     // join handle for the coordinator
     writer_join: Option<thread::JoinHandle<io::Result<ShardedWriterOutcome>>>,
-
+ 
     // shard count and final fsync policy (retained for coordinator use)
     shards: usize,
     sync_final: bool,
+    hashing: bool,
 }
 
 impl AsyncShardedZstdFramesJsonlWriter {
@@ -738,6 +769,7 @@ impl AsyncShardedZstdFramesJsonlWriter {
         frame_max_bytes: usize,
         writer_queue_frames: usize,
         sync_final: bool,
+        hashing: bool,
     ) -> Self {
         let shards = shard_files.len().max(1);
         let (tx, rx) = bounded::<FrameMsg>(writer_queue_frames.max(1));
@@ -765,20 +797,21 @@ impl AsyncShardedZstdFramesJsonlWriter {
                     FrameMsg::Data(f) => {
                         let shard = (f.id as usize) % shards;
                         let offset = compressed_pos[shard];
-
+ 
                         // Compress frame into corresponding shard writer while hashing and counting
                         {
                             let mut counting_writer = HashingFileWrite {
                                 inner: &mut nodes_writers[shard],
                                 hasher: &mut hasher_nodes[shard],
                                 pos: &mut compressed_pos[shard],
+                                hashing,
                             };
                             let mut encoder = zstd::stream::write::Encoder::new(&mut counting_writer, zstd_level)?;
                             let _ = encoder.multithread(zstd_threads.max(1) as u32);
                             encoder.write_all(&f.uncompressed)?;
                             let _ = encoder.finish();
                         }
-
+ 
                         // Emit one index line to shared index with shard field and global frame id
                         if let (Some(idxw), Some(h)) = (idx_writer.as_mut(), hasher_idx.as_mut()) {
                             let line = serde_json::json!({
@@ -793,9 +826,11 @@ impl AsyncShardedZstdFramesJsonlWriter {
                             let mut tmp = serde_json::to_vec(&line).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
                             tmp.push(b'\n');
                             idxw.write_all(&tmp)?;
-                            h.update(&tmp);
+                            if hashing {
+                                h.update(&tmp);
+                            }
                         }
-
+ 
                         frame_count = frame_count.saturating_add(1);
                         total_lines = total_lines.saturating_add(f.line_count as u64);
                     }
@@ -822,10 +857,14 @@ impl AsyncShardedZstdFramesJsonlWriter {
             }
 
             // Finalize per-shard digests
-            let nodes_sha256_list: Vec<String> = hasher_nodes
-                .into_iter()
-                .map(|h| hex::encode(h.finalize()))
-                .collect();
+            let nodes_sha256_list: Vec<String> = if hashing {
+                hasher_nodes
+                    .into_iter()
+                    .map(|h| hex::encode(h.finalize()))
+                    .collect()
+            } else {
+                Vec::new()
+            };
 
             let index_sha = hasher_idx.map(|h| hex::encode(h.finalize()));
 
@@ -850,6 +889,7 @@ impl AsyncShardedZstdFramesJsonlWriter {
             writer_join: Some(join),
             shards,
             sync_final,
+            hashing,
         }
     }
 
@@ -935,9 +975,9 @@ impl GraphJsonlSink for AsyncShardedZstdFramesJsonlWriter {
         Ok(GraphSinkStats {
             total_lines: outcome.total_lines,
             frame_count: outcome.frame_count,
-            nodes_sha256_hex: String::new(),
+            nodes_sha256_hex: if self.hashing { outcome.nodes_sha256_list.get(0).cloned() } else { None },
             index_sha256_hex: outcome.index_sha256_hex,
-            nodes_sha256_list: Some(outcome.nodes_sha256_list),
+            nodes_sha256_list: if self.hashing { Some(outcome.nodes_sha256_list) } else { None },
         })
     }
 }

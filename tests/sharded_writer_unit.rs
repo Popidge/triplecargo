@@ -37,6 +37,7 @@ fn sharded_writer_simple_smoke() {
         frame_bytes,
         writer_queue_frames,
         sync_final,
+        true, // hashing enabled
     );
 
     // Emit a small number of lines (10) so both shards get some frames

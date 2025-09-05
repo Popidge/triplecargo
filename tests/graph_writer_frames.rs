@@ -30,6 +30,7 @@ fn zstd_writer_frame_bytes_cap_triggers_multiple_frames() {
         frame_lines,
         frame_bytes, // frame max bytes (soft cap, uncompressed)
         false,       // sync_final
+        true,        // hashing enabled
     );
 
     // Write ~3.2 MiB uncompressed payload: 800 lines of 4096 bytes (+ newline added by writer)
@@ -71,6 +72,7 @@ fn zstd_writer_large_frame_bytes_cap_aggregates_into_single_frame() {
         frame_lines,
         frame_bytes,  // large cap
         false,        // sync_final
+        true,         // hashing enabled
     );
 
     // ~4 MiB uncompressed: 1024 lines of 4096 bytes (+ newline)

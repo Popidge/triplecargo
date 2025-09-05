@@ -45,6 +45,7 @@ fn async_ordering_preserved_with_workers_2_and_index_enabled() {
         2,                 // zstd_workers (pool)
         4,                 // compressed frames queue
         false,             // sync_final
+        true,              // hashing enabled
     );
 
     let n = 64usize;
@@ -104,6 +105,7 @@ fn async_workers0_and_workers2_yield_identical_outputs_small_payload() {
             0,  // workers=0 => single-stage
             4,  // compressed queue unused
             false,
+            true, // hashing enabled
         );
         write_n_json_lines(&mut w0, 32);
         let _ = w0.finish_mut().expect("finish0");
@@ -125,6 +127,7 @@ fn async_workers0_and_workers2_yield_identical_outputs_small_payload() {
             2,  // workers=2
             4,
             false,
+            true, // hashing enabled
         );
         write_n_json_lines(&mut w2, 32);
         let _ = w2.finish_mut().expect("finish2");
@@ -161,6 +164,7 @@ fn async_no_deadlock_with_index_disabled() {
         2,                  // workers
         1,                  // compressed queue
         false,
+        true,               // hashing enabled
     );
     write_n_json_lines(&mut w, 128);
     let stats = w.finish_mut().expect("finish");
