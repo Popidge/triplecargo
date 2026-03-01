@@ -9,7 +9,12 @@ use crate::types::{Element, Owner};
 
 #[inline]
 fn clamp_side(v: i16) -> u8 {
-    v.clamp(1, 10) as u8
+    v.clamp(0, 11) as u8
+}
+
+#[inline]
+fn raw_sides(card: &Card) -> [u8; 4] {
+    [card.top, card.right, card.bottom, card.left]
 }
 
 #[inline]
@@ -32,13 +37,13 @@ fn elemental_delta(cell_elem: Option<Element>, card_elem: Option<Element>) -> i1
 /// Sides order: [top, right, bottom, left]
 fn adjusted_sides_for_cell(card: &Card, cell_idx: u8, board: &Board, rules: &Rules) -> [u8; 4] {
     if !rules.elemental {
-        return [card.top, card.right, card.bottom, card.left];
+        return raw_sides(card);
     }
     let delta = elemental_delta(board.cell_element(cell_idx), card.element) as i16;
     if delta == 0 {
-        return [card.top, card.right, card.bottom, card.left];
+        return raw_sides(card);
     }
-    let sides = [card.top, card.right, card.bottom, card.left];
+    let sides = raw_sides(card);
     [
         clamp_side(sides[0] as i16 + delta),
         clamp_side(sides[1] as i16 + delta),
@@ -47,179 +52,211 @@ fn adjusted_sides_for_cell(card: &Card, cell_idx: u8, board: &Board, rules: &Rul
     ]
 }
 
-/// Apply the Basic capture rule from an origin card at origin_idx.
-/// Flips only strictly-less adjacent opponent cards. No cascades here.
-/// Returns a deduplicated, sorted list of (index, old_owner) that flipped.
-fn apply_basic_from(
-    board: &mut Board,
-    cards: &CardsDb,
-    rules: &Rules,
-    origin_idx: u8,
-) -> Vec<(u8, Owner)> {
-    let origin_slot = match board.get(origin_idx) {
-        Some(s) => s,
-        None => return Vec::new(),
-    };
-    let origin_owner = origin_slot.owner;
-    let origin_card = match cards.get(origin_slot.card_id) {
-        Some(c) => c,
-        None => return Vec::new(),
-    };
-    let o_sides = adjusted_sides_for_cell(origin_card, origin_idx, board, rules);
+#[inline]
+fn owner_after_mask(
+    board: &Board,
+    idx: u8,
+    placed_owner: Owner,
+    capture_mask: &[bool; 9],
+) -> Option<Owner> {
+    board.get(idx).map(|slot| {
+        if capture_mask[idx as usize] {
+            placed_owner
+        } else {
+            slot.owner
+        }
+    })
+}
 
-    let neighs = board.neighbors(origin_idx);
-    let mut flipped: Vec<(u8, Owner)> = Vec::new();
+/// Build the full capture mask for a placed card without mutating ownership incrementally.
+/// Captures are resolved with precedence: Same -> Plus -> Basic/Combo BFS.
+fn build_capture_mask(board: &Board, cards: &CardsDb, rules: &Rules, placed_idx: u8) -> [bool; 9] {
+    let mut capture_mask = [false; 9];
 
-    for (i, opt_nidx) in neighs.iter().enumerate() {
-        let Some(nidx) = opt_nidx else { continue };
-        let Some(mut nslot) = board.get(*nidx) else {
+    let Some(placed_slot) = board.get(placed_idx) else {
+        return capture_mask;
+    };
+    let placed_owner = placed_slot.owner;
+    let Some(placed_card) = cards.get(placed_slot.card_id) else {
+        return capture_mask;
+    };
+    // Same/Plus/Same Wall use raw printed ranks (Elemental does not apply).
+    let placed_raw_sides = raw_sides(placed_card);
+    let placed_neighbors = board.neighbors(placed_idx);
+
+    // Gather occupied cardinal neighbors once.
+    let mut occ_idx: [Option<u8>; 4] = [None; 4];
+    let mut occ_owner: [Owner; 4] = [placed_owner; 4];
+    let mut occ_touch: [u8; 4] = [0; 4];
+    let mut opp_count = 0u8;
+
+    for i in 0..4 {
+        let Some(nidx) = placed_neighbors[i] else {
             continue;
         };
-        if nslot.owner == origin_owner {
+        let Some(nslot) = board.get(nidx) else {
             continue;
-        }
+        };
         let Some(ncard) = cards.get(nslot.card_id) else {
             continue;
         };
-        let n_sides = adjusted_sides_for_cell(ncard, *nidx, board, rules);
+        let n_sides = raw_sides(ncard);
 
-        let placed_side = o_sides[i];
-        // Opposite side index mapping: 0<->2, 1<->3
-        let opp_idx = (i + 2) % 4;
-        let neigh_side = n_sides[opp_idx];
-
-        if placed_side > neigh_side {
-            let old_owner = nslot.owner;
-            nslot.owner = origin_owner; // flip
-            board.set(*nidx, Some(nslot));
-            flipped.push((*nidx, old_owner));
+        occ_idx[i] = Some(nidx);
+        occ_owner[i] = nslot.owner;
+        occ_touch[i] = n_sides[(i + 2) % 4];
+        if nslot.owner != placed_owner {
+            opp_count = opp_count.saturating_add(1);
         }
     }
 
-    // Deterministic order
-    flipped.sort_unstable_by_key(|(idx, _)| *idx);
-    flipped.dedup_by_key(|(idx, _)| *idx);
-    flipped
-}
-
-/// Evaluate Same and Plus triggers for the just-placed card at placed_idx.
-/// Performs the initial flips if either rule triggers. Returns the set of newly flipped neighbors as (idx, old_owner).
-fn apply_same_plus_if_any(
-    board: &mut Board,
-    cards: &CardsDb,
-    rules: &Rules,
-    placed_idx: u8,
-) -> Vec<(u8, Owner)> {
-    let slot = match board.get(placed_idx) {
-        Some(s) => s,
-        None => return Vec::new(),
-    };
-    let owner = slot.owner;
-    let card = match cards.get(slot.card_id) {
-        Some(c) => c,
-        None => return Vec::new(),
-    };
-    let p_sides = adjusted_sides_for_cell(card, placed_idx, board, rules);
-    let neighs = board.neighbors(placed_idx);
-
-    // Collect opponent neighbors and their touching side values.
-    // For direction i in [0..4): placed side index i; neighbor side index opp (i+2)%4
-    let mut opp_idxs: [Option<u8>; 4] = [None; 4];
-    let mut opp_touch_vals: [u8; 4] = [0; 4];
-    let mut equal_dirs_for_same: [bool; 4] = [false; 4];
-    let mut wall_equalities = 0usize;
-
-    for i in 0..4 {
-        match neighs[i] {
-            Some(nidx) => {
-                if let Some(nslot) = board.get(nidx) {
-                    if nslot.owner != owner {
-                        if let Some(nc) = cards.get(nslot.card_id) {
-                            let ns = adjusted_sides_for_cell(nc, nidx, board, rules);
-                            opp_idxs[i] = Some(nidx);
-                            opp_touch_vals[i] = ns[(i + 2) % 4];
-
-                            // Same equality check (only opponent neighbors count)
-                            if rules.same && p_sides[i] == opp_touch_vals[i] {
-                                equal_dirs_for_same[i] = true;
-                            }
-                        }
-                    }
-                }
-            }
-            None => {
-                // Possible Same Wall contribution
-                if rules.same && rules.same_wall && p_sides[i] == 10 {
-                    wall_equalities += 1;
-                }
-            }
-        }
+    // If there are no opposing neighbors, no captures occur.
+    if opp_count == 0 {
+        return capture_mask;
     }
 
-    // Determine Same flips
-    let same_count = equal_dirs_for_same.iter().filter(|&b| *b).count() + wall_equalities;
-    let mut to_flip_idxs: Vec<u8> = Vec::new();
+    let mut same_captured_dirs = [false; 4];
+    let mut plus_captured_dirs = [false; 4];
 
-    if rules.same && same_count >= 2 {
+    // Same precedence (per-opponent-neighbor), with optional Same Wall contributor support.
+    if rules.same {
+        let mut eq_on_occupied = [false; 4];
+        let mut eq_on_wall = [false; 4];
+
         for i in 0..4 {
-            if equal_dirs_for_same[i] {
-                if let Some(nidx) = opp_idxs[i] {
-                    to_flip_idxs.push(nidx);
-                }
+            if occ_idx[i].is_some() {
+                eq_on_occupied[i] = placed_raw_sides[i] == occ_touch[i];
+            } else if rules.same_wall && placed_neighbors[i].is_none() && placed_raw_sides[i] == 10
+            {
+                eq_on_wall[i] = true;
             }
         }
-    }
 
-    // Determine Plus flips
-    if rules.plus {
-        // Count sums; we only consider opponent neighbors (non-wall).
-        // Sums range 2..=20
-        let mut counts = [0u8; 21];
-        let mut sums: [u8; 4] = [0; 4];
-        let mut active: [bool; 4] = [false; 4];
         for i in 0..4 {
-            if let Some(_nidx) = opp_idxs[i] {
-                let s = p_sides[i] + opp_touch_vals[i];
-                sums[i] = s;
-                active[i] = true;
-                counts[s as usize] = counts[s as usize].saturating_add(1);
+            if occ_owner[i] == placed_owner || !eq_on_occupied[i] {
+                continue;
             }
-        }
-        let mut any_pair = false;
-        for cnt in counts.iter() {
-            if *cnt >= 2 {
-                any_pair = true;
-                break;
+            let mut has_other_equality = false;
+            for j in 0..4 {
+                if i == j {
+                    continue;
+                }
+                if eq_on_occupied[j] || eq_on_wall[j] {
+                    has_other_equality = true;
+                    break;
+                }
             }
-        }
-        if any_pair {
-            for i in 0..4 {
-                if active[i] && counts[sums[i] as usize] >= 2 {
-                    if let Some(nidx) = opp_idxs[i] {
-                        to_flip_idxs.push(nidx);
-                    }
+            if has_other_equality {
+                same_captured_dirs[i] = true;
+                if let Some(idx) = occ_idx[i] {
+                    capture_mask[idx as usize] = true;
                 }
             }
         }
     }
 
-    // Perform the initial flips if any; deterministically ordered, unique.
-    to_flip_idxs.sort_unstable();
-    to_flip_idxs.dedup();
+    let same_triggered = same_captured_dirs.iter().any(|&v| v);
 
-    let mut flipped: Vec<(u8, Owner)> = Vec::new();
-    if !to_flip_idxs.is_empty() {
-        for nidx in &to_flip_idxs {
-            if let Some(mut nslot) = board.get(*nidx) {
-                let old_owner = nslot.owner;
-                nslot.owner = owner;
-                board.set(*nidx, Some(nslot));
-                flipped.push((*nidx, old_owner));
+    // Plus runs only if Same did not capture at least one card.
+    if !same_triggered && rules.plus {
+        let mut sums = [0u8; 4];
+        for i in 0..4 {
+            if occ_idx[i].is_some() {
+                sums[i] = placed_raw_sides[i] + occ_touch[i];
+            }
+        }
+
+        for i in 0..4 {
+            if occ_owner[i] == placed_owner || occ_idx[i].is_none() {
+                continue;
+            }
+            let mut has_other_equal_sum = false;
+            for j in 0..4 {
+                if i == j || occ_idx[j].is_none() {
+                    continue;
+                }
+                if sums[j] == sums[i] {
+                    has_other_equal_sum = true;
+                    break;
+                }
+            }
+            if has_other_equal_sum {
+                plus_captured_dirs[i] = true;
+                if let Some(idx) = occ_idx[i] {
+                    capture_mask[idx as usize] = true;
+                }
             }
         }
     }
 
-    flipped
+    // Basic / Combo expansion using BFS from rule-defined sources.
+    let mut q: VecDeque<u8> = VecDeque::new();
+    let mut enqueued = [false; 9];
+
+    if same_triggered {
+        for i in 0..4 {
+            if same_captured_dirs[i] {
+                let idx = occ_idx[i].expect("same capture direction must have occupied neighbor");
+                if !enqueued[idx as usize] {
+                    enqueued[idx as usize] = true;
+                    q.push_back(idx);
+                }
+            }
+        }
+    } else {
+        enqueued[placed_idx as usize] = true;
+        q.push_back(placed_idx);
+        for i in 0..4 {
+            if plus_captured_dirs[i] {
+                let idx = occ_idx[i].expect("plus capture direction must have occupied neighbor");
+                if !enqueued[idx as usize] {
+                    enqueued[idx as usize] = true;
+                    q.push_back(idx);
+                }
+            }
+        }
+    }
+
+    while let Some(src_idx) = q.pop_front() {
+        let Some(src_slot) = board.get(src_idx) else {
+            continue;
+        };
+        let Some(src_card) = cards.get(src_slot.card_id) else {
+            continue;
+        };
+        let src_owner = owner_after_mask(board, src_idx, placed_owner, &capture_mask)
+            .expect("source card must exist during BFS");
+        let src_sides = adjusted_sides_for_cell(src_card, src_idx, board, rules);
+        let src_neighbors = board.neighbors(src_idx);
+
+        for i in 0..4 {
+            let Some(nidx) = src_neighbors[i] else {
+                continue;
+            };
+            let Some(nslot) = board.get(nidx) else {
+                continue;
+            };
+            let neigh_owner = owner_after_mask(board, nidx, placed_owner, &capture_mask)
+                .expect("neighbor card must exist during BFS");
+            if neigh_owner == src_owner {
+                continue;
+            }
+
+            let Some(ncard) = cards.get(nslot.card_id) else {
+                continue;
+            };
+            let n_sides = adjusted_sides_for_cell(ncard, nidx, board, rules);
+            if src_sides[i] > n_sides[(i + 2) % 4] && !capture_mask[nidx as usize] {
+                capture_mask[nidx as usize] = true;
+                if !enqueued[nidx as usize] {
+                    enqueued[nidx as usize] = true;
+                    q.push_back(nidx);
+                }
+            }
+        }
+    }
+
+    capture_mask
 }
 
 /// Apply a move as a pure transform: returns a new GameState on success.
@@ -284,44 +321,23 @@ pub fn make_move(state: &mut GameState, cards: &CardsDb, mv: Move) -> Result<Und
     // Incremental Z: add board token for placed
     state.zobrist ^= z_token_board(mv.cell, placed_owner, mv.card_id);
 
-    // Initial flips (Same/Plus)
-    let mut flips: Vec<(u8, Owner)> =
-        apply_same_plus_if_any(&mut state.board, cards, &state.rules, mv.cell);
-    for (idx, old_owner) in &flips {
-        let slot = state.board.get(*idx).expect("flipped slot present");
-        let card_id = slot.card_id;
-        // remove old owner token, add new owner token
-        state.zobrist ^= z_token_board(*idx, *old_owner, card_id);
-        state.zobrist ^= z_token_board(*idx, slot.owner, card_id);
-    }
-
-    if flips.is_empty() {
-        // Apply Basic once from placed card only
-        let mut f = apply_basic_from(&mut state.board, cards, &state.rules, mv.cell);
-        for (idx, old_owner) in &f {
-            let slot = state.board.get(*idx).expect("flipped slot present");
-            let card_id = slot.card_id;
-            state.zobrist ^= z_token_board(*idx, *old_owner, card_id);
-            state.zobrist ^= z_token_board(*idx, slot.owner, card_id);
+    let capture_mask = build_capture_mask(&state.board, cards, &state.rules, mv.cell);
+    let mut flips: Vec<(u8, Owner)> = Vec::new();
+    for idx in 0u8..9u8 {
+        if !capture_mask[idx as usize] {
+            continue;
         }
-        flips.append(&mut f);
-    } else {
-        // Combo cascades: BFS over newly flipped cards, applying Basic only
-        let mut q: VecDeque<u8> = VecDeque::new();
-        for (idx, _) in &flips {
-            q.push_back(*idx);
-        }
-        while let Some(idx) = q.pop_front() {
-            let mut f = apply_basic_from(&mut state.board, cards, &state.rules, idx);
-            for (fi, old_owner) in &f {
-                // incremental Z for each flip
-                let slot = state.board.get(*fi).expect("flipped slot present");
-                let card_id = slot.card_id;
-                state.zobrist ^= z_token_board(*fi, *old_owner, card_id);
-                state.zobrist ^= z_token_board(*fi, slot.owner, card_id);
-                q.push_back(*fi);
+        if let Some(mut slot) = state.board.get(idx) {
+            let old_owner = slot.owner;
+            if old_owner == placed_owner {
+                continue;
             }
-            flips.append(&mut f);
+            // remove old owner token, add new owner token
+            state.zobrist ^= z_token_board(idx, old_owner, slot.card_id);
+            slot.owner = placed_owner;
+            state.board.set(idx, Some(slot));
+            state.zobrist ^= z_token_board(idx, slot.owner, slot.card_id);
+            flips.push((idx, old_owner));
         }
     }
 

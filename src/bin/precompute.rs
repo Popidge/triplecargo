@@ -995,7 +995,7 @@ fn elemental_delta_local(cell_elem: Option<Element>, card_elem: Option<Element>)
 
 #[inline]
 fn clamp_side_local(v: i16) -> u8 {
-    v.clamp(1, 10) as u8
+    v.clamp(0, 11) as u8
 }
 
 #[inline]

@@ -244,6 +244,348 @@ fn cross_rule_same_plus_interaction_stable() {
     assert_eq!(ns.board.get(5).unwrap().owner, Owner::A);
 }
 
+/// Same contributors include any occupied neighbor ownership, not only opponents.
+#[test]
+fn same_uses_ally_neighbor_as_equality_contributor() {
+    let cards = cards_db();
+    let rules = Rules::new(false, true, false, false);
+
+    // A plays Cactaur id=31 at center.
+    // Opponent top neighbor matches (top=6 vs bottom=6): card 45 at cell 1 (B).
+    // Ally left neighbor also matches (left=3 vs right=3): card 14 at cell 3 (A).
+    // Same should capture the top opponent card because ally equality contributes.
+    let mut state = GameState::with_hands(rules, [31, 2, 3, 4, 5], [6, 7, 8, 9, 10], None);
+    state.board.set(
+        1,
+        Some(triplecargo::board::Slot {
+            owner: Owner::B,
+            card_id: 45,
+        }),
+    );
+    state.board.set(
+        3,
+        Some(triplecargo::board::Slot {
+            owner: Owner::A,
+            card_id: 14,
+        }),
+    );
+
+    let ns = apply_move(
+        &state,
+        &cards,
+        Move {
+            card_id: 31,
+            cell: 4,
+        },
+    )
+    .expect("apply_move");
+
+    assert_eq!(ns.board.get(1).unwrap().owner, Owner::A);
+}
+
+/// Plus contributors include any occupied neighbor ownership, not only opponents.
+#[test]
+fn plus_uses_ally_neighbor_as_sum_contributor() {
+    let cards = cards_db();
+    let rules = Rules::new(false, false, true, false);
+
+    // A plays Quezacotl id=83 at center.
+    // Opponent top contributes sum 2 + 9 = 11 (card 81 at cell 1).
+    // Ally right contributes sum 9 + 2 = 11 (card 61 at cell 5).
+    // Plus should capture the top opponent card with ally as contributor.
+    let mut state = GameState::with_hands(rules, [83, 2, 3, 4, 5], [6, 7, 8, 9, 10], None);
+    state.board.set(
+        1,
+        Some(triplecargo::board::Slot {
+            owner: Owner::B,
+            card_id: 81,
+        }),
+    );
+    state.board.set(
+        5,
+        Some(triplecargo::board::Slot {
+            owner: Owner::A,
+            card_id: 61,
+        }),
+    );
+
+    let ns = apply_move(
+        &state,
+        &cards,
+        Move {
+            card_id: 83,
+            cell: 4,
+        },
+    )
+    .expect("apply_move");
+
+    assert_eq!(ns.board.get(1).unwrap().owner, Owner::A);
+}
+
+/// If Same captures at least one card, Plus and placed-card Basic are suppressed.
+#[test]
+fn same_suppresses_plus_and_placed_basic() {
+    let cards = cards_db();
+    let rules = Rules::new(false, true, true, false);
+
+    // A plays Cactaur id=31 at center.
+    // Same trigger:
+    // - top opponent equality (cell 1, id 45, bottom=6)
+    // - left ally equality contributor (cell 3, id 14, right=3)
+    // Plus would otherwise capture right opponent (cell 5, id 94) with equal sum 12 to top.
+    // Placed-card Basic would otherwise capture bottom opponent (cell 7, id 60, top=1).
+    let mut state = GameState::with_hands(rules, [31, 2, 3, 4, 5], [6, 7, 8, 9, 10], None);
+    state.board.set(
+        1,
+        Some(triplecargo::board::Slot {
+            owner: Owner::B,
+            card_id: 45,
+        }),
+    );
+    state.board.set(
+        3,
+        Some(triplecargo::board::Slot {
+            owner: Owner::A,
+            card_id: 14,
+        }),
+    );
+    state.board.set(
+        5,
+        Some(triplecargo::board::Slot {
+            owner: Owner::B,
+            card_id: 94,
+        }),
+    );
+    state.board.set(
+        7,
+        Some(triplecargo::board::Slot {
+            owner: Owner::B,
+            card_id: 60,
+        }),
+    );
+
+    let ns = apply_move(
+        &state,
+        &cards,
+        Move {
+            card_id: 31,
+            cell: 4,
+        },
+    )
+    .expect("apply_move");
+
+    assert_eq!(
+        ns.board.get(1).unwrap().owner,
+        Owner::A,
+        "Same capture applies"
+    );
+    assert_eq!(
+        ns.board.get(5).unwrap().owner,
+        Owner::B,
+        "Plus is suppressed when Same triggers"
+    );
+    assert_eq!(
+        ns.board.get(7).unwrap().owner,
+        Owner::B,
+        "placed-card Basic is suppressed when Same triggers"
+    );
+}
+
+/// When Same does not trigger, Plus captures and Basic can both apply in one move.
+#[test]
+fn plus_and_basic_can_both_apply() {
+    let cards = cards_db();
+    let rules = Rules::new(false, true, true, false);
+
+    // A plays Quezacotl id=83 at center.
+    // Plus captures top and right (equal sums 11).
+    // Basic from placed card captures bottom (4 > 1).
+    let mut state = GameState::with_hands(rules, [83, 2, 3, 4, 5], [81, 61, 60, 9, 10], None);
+    state.board.set(
+        1,
+        Some(triplecargo::board::Slot {
+            owner: Owner::B,
+            card_id: 81,
+        }),
+    );
+    state.board.set(
+        5,
+        Some(triplecargo::board::Slot {
+            owner: Owner::B,
+            card_id: 61,
+        }),
+    );
+    state.board.set(
+        7,
+        Some(triplecargo::board::Slot {
+            owner: Owner::B,
+            card_id: 60,
+        }),
+    );
+
+    let ns = apply_move(
+        &state,
+        &cards,
+        Move {
+            card_id: 83,
+            cell: 4,
+        },
+    )
+    .expect("apply_move");
+
+    assert_eq!(
+        ns.board.get(1).unwrap().owner,
+        Owner::A,
+        "Plus captured top"
+    );
+    assert_eq!(
+        ns.board.get(5).unwrap().owner,
+        Owner::A,
+        "Plus captured right"
+    );
+    assert_eq!(
+        ns.board.get(7).unwrap().owner,
+        Owner::A,
+        "Basic from placed card captured bottom"
+    );
+}
+
+/// Elemental modifiers do not affect Same checks.
+#[test]
+fn elemental_does_not_affect_same() {
+    let cards = cards_db();
+    let rules = Rules::new(true, true, false, false);
+
+    // A plays Sacred id=87 at center: top=5, left=9 (raw ranks for Same).
+    // Top opponent Bomb id=37 has bottom=6 raw; on Earth cell it would become 5 if Elemental were
+    // (incorrectly) used for Same. Left ally Seifer id=109 contributes another raw equality (9 == 9).
+    // Correct behavior: Same ignores elemental, so top remains non-equal and no capture occurs.
+    let mut elements = [None; 9];
+    elements[1] = Some(triplecargo::Element::Earth); // mismatch for Bomb(Fire)
+
+    let mut state =
+        GameState::with_hands(rules, [87, 2, 3, 4, 5], [37, 7, 8, 9, 10], Some(elements));
+    state.board.set(
+        1,
+        Some(triplecargo::board::Slot {
+            owner: Owner::B,
+            card_id: 37,
+        }),
+    );
+    state.board.set(
+        3,
+        Some(triplecargo::board::Slot {
+            owner: Owner::A,
+            card_id: 109,
+        }),
+    );
+
+    let ns = apply_move(
+        &state,
+        &cards,
+        Move {
+            card_id: 87,
+            cell: 4,
+        },
+    )
+    .expect("apply_move");
+
+    assert_eq!(
+        ns.board.get(1).unwrap().owner,
+        Owner::B,
+        "top card should not flip via Same when only elemental-adjusted values match"
+    );
+}
+
+/// Elemental modifiers do not affect Plus checks.
+#[test]
+fn elemental_does_not_affect_plus() {
+    let cards = cards_db();
+    let rules = Rules::new(true, false, true, false);
+
+    // A plays Sacred id=87 at center. Raw sums:
+    // - top opponent Bomb id=37: 5 + 6 = 11
+    // - left ally Fungar id=2:   9 + 1 = 10
+    // If Elemental were (incorrectly) used for Plus, Bomb bottom on Earth would be 5 and sums tie at 10.
+    // Correct behavior: Plus ignores elemental, so no Plus capture.
+    let mut elements = [None; 9];
+    elements[1] = Some(triplecargo::Element::Earth); // mismatch for Bomb(Fire)
+
+    let mut state =
+        GameState::with_hands(rules, [87, 2, 3, 4, 5], [37, 7, 8, 9, 10], Some(elements));
+    state.board.set(
+        1,
+        Some(triplecargo::board::Slot {
+            owner: Owner::B,
+            card_id: 37,
+        }),
+    );
+    state.board.set(
+        3,
+        Some(triplecargo::board::Slot {
+            owner: Owner::A,
+            card_id: 2,
+        }),
+    );
+
+    let ns = apply_move(
+        &state,
+        &cards,
+        Move {
+            card_id: 87,
+            cell: 4,
+        },
+    )
+    .expect("apply_move");
+
+    assert_eq!(
+        ns.board.get(1).unwrap().owner,
+        Owner::B,
+        "top card should not flip via Plus when only elemental-adjusted sums match"
+    );
+}
+
+/// Elemental modifiers do not affect Same Wall checks.
+#[test]
+fn elemental_does_not_affect_same_wall() {
+    let cards = cards_db();
+    let rules = Rules::new(true, true, false, true);
+
+    // A plays Minotaur id=88 at top-middle (cell 1), on Earth element.
+    // Raw top is 9, but elemental-adjusted would be 10.
+    // Right opponent Cerberus id=94 has left=10.
+    // Incorrect behavior (elemental used for Same Wall): wall equality + right equality => capture.
+    // Correct behavior: Same/Same Wall use raw ranks (top=9, right=9), so no capture.
+    let mut elements = [None; 9];
+    elements[1] = Some(triplecargo::Element::Earth);
+
+    let mut state =
+        GameState::with_hands(rules, [88, 2, 3, 4, 5], [94, 7, 8, 9, 10], Some(elements));
+    state.board.set(
+        2,
+        Some(triplecargo::board::Slot {
+            owner: Owner::B,
+            card_id: 94,
+        }),
+    );
+
+    let ns = apply_move(
+        &state,
+        &cards,
+        Move {
+            card_id: 88,
+            cell: 1,
+        },
+    )
+    .expect("apply_move");
+
+    assert_eq!(
+        ns.board.get(2).unwrap().owner,
+        Owner::B,
+        "right card should not flip via Same Wall from elemental-adjusted top=10"
+    );
+}
+
 /// Zero-allocation-ish assertion on legal_moves capacity: vector is preallocated to exact size.
 /// This helps ensure no reallocation occurs while pushing moves.
 #[test]

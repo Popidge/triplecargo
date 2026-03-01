@@ -265,10 +265,10 @@ impl TriplecargoApp {
 
     fn get_score(&self) -> (u8, u8) {
         let diff = score(&self.state);
-        // Convert difference to counts: A + B = 9, A - B = diff
-        // A = (9 + diff) / 2, B = (9 - diff) / 2
-        let a_count = ((9i16 + diff as i16) / 2) as u8;
-        let b_count = 9 - a_count;
+        // Convert difference to ownership totals: A + B = 10, A - B = diff
+        // A = (10 + diff) / 2, B = (10 - diff) / 2
+        let a_count = ((10i16 + diff as i16) / 2) as u8;
+        let b_count = 10 - a_count;
         (a_count, b_count)
     }
 

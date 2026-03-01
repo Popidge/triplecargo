@@ -62,8 +62,9 @@ fn apply_move_basic_no_flip_on_tie() {
     let neigh = ns.board.get(5).expect("neighbor present");
     assert_eq!(neigh.owner, Owner::B);
 
-    // Score should show A owns exactly 1 (the placed card), B owns 1 (the neighbor)
-    assert_eq!(score(&ns), 0);
+    // Score now counts hand + board ownership delta.
+    // This fixture has one extra pre-placed B card not removed from hand, so delta is -1.
+    assert_eq!(score(&ns), -1);
 }
 
 #[test]
@@ -80,6 +81,7 @@ fn apply_move_basic_flip_strictly_greater() {
             card_id: 7,
         }),
     );
+    state.hands_b[1] = None; // card 7 is now on board
 
     // A plays Geezard id=1 at center (cell 4), right=4 vs left=1 -> should flip neighbor at cell 5.
     let ns = apply_move(
@@ -131,6 +133,106 @@ fn elemental_adjustment_causes_flip() {
     .expect("apply_move");
     let neigh = ns.board.get(1).expect("neighbor present");
     assert_eq!(neigh.owner, Owner::A);
+}
+
+#[test]
+fn elemental_allows_natural_11_for_basic_capture() {
+    let cards = cards_db();
+    let rules = Rules::new(true, false, false, false);
+
+    // Pandemonia id=93 has top=10 and element Wind.
+    // On a Wind cell, top becomes 11 with natural clamping.
+    // Against neighbor bottom=10 this should flip (11 > 10).
+    let mut elements = [None; 9];
+    elements[4] = Some(triplecargo::Element::Wind);
+
+    let mut state =
+        GameState::with_hands(rules, [93, 2, 3, 4, 5], [89, 7, 8, 9, 10], Some(elements));
+    state.board.set(
+        1,
+        Some(triplecargo::board::Slot {
+            owner: Owner::B,
+            card_id: 89,
+        }),
+    );
+
+    let ns = apply_move(
+        &state,
+        &cards,
+        Move {
+            card_id: 93,
+            cell: 4,
+        },
+    )
+    .expect("apply_move");
+
+    assert_eq!(ns.board.get(1).unwrap().owner, Owner::A);
+}
+
+#[test]
+fn elemental_negative_on_elemental_cell_blocks_flip() {
+    let cards = cards_db();
+    let rules = Rules::new(true, false, false, false);
+
+    // Center elemental cell with a no-element card incurs -1 to all sides.
+    // Geezard id=1 has right=4; adjusted right becomes 3 on elemental mismatch/no-element.
+    // Neighbor Ochu id=28 has left=3, so comparison becomes tie (3 vs 3) and should not flip.
+    let mut elements = [None; 9];
+    elements[4] = Some(triplecargo::Element::Earth);
+
+    let mut state =
+        GameState::with_hands(rules, [1, 2, 3, 4, 5], [28, 7, 8, 9, 10], Some(elements));
+    state.board.set(
+        5,
+        Some(triplecargo::board::Slot {
+            owner: Owner::B,
+            card_id: 28,
+        }),
+    );
+
+    let ns = apply_move(
+        &state,
+        &cards,
+        Move {
+            card_id: 1,
+            cell: 4,
+        },
+    )
+    .expect("apply_move");
+
+    assert_eq!(ns.board.get(5).unwrap().owner, Owner::B);
+}
+
+#[test]
+fn score_counts_hand_and_board_ownership() {
+    let cards = cards_db();
+    let rules = Rules::basic_only();
+
+    // Balanced 10-card model starts at 0.
+    let mut state = GameState::with_hands(rules, [1, 2, 3, 4, 5], [6, 7, 8, 9, 10], None);
+    assert_eq!(score(&state), 0);
+
+    // A plays and captures one B card from board:
+    // board delta +2 (placed + captured), hand delta -1 (played card), net +1.
+    state.board.set(
+        5,
+        Some(triplecargo::board::Slot {
+            owner: Owner::B,
+            card_id: 7,
+        }),
+    );
+
+    let ns = apply_move(
+        &state,
+        &cards,
+        Move {
+            card_id: 1,
+            cell: 4,
+        },
+    )
+    .expect("apply_move");
+
+    assert_eq!(score(&ns), 1);
 }
 
 #[test]

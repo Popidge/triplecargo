@@ -1,8 +1,8 @@
 use crate::state::GameState;
 use crate::types::Owner;
 
-/// Compute board score = (#A owned) - (#B owned).
-/// Per spec, scoring is by board ownership only (after 9 turns the board is full).
+/// Compute ownership delta over board plus unplayed hands.
+/// Score = (A board + A hand) - (B board + B hand).
 #[inline]
 pub fn score(state: &GameState) -> i8 {
     let mut a: i8 = 0;
@@ -15,5 +15,17 @@ pub fn score(state: &GameState) -> i8 {
             }
         }
     }
+
+    for slot in &state.hands_a {
+        if slot.is_some() {
+            a += 1;
+        }
+    }
+    for slot in &state.hands_b {
+        if slot.is_some() {
+            b += 1;
+        }
+    }
+
     a - b
 }
