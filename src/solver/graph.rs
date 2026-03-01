@@ -6,27 +6,26 @@
 
 use std::error::Error;
 use std::hash::BuildHasherDefault;
-use std::sync::{Arc, Mutex};
 use std::io::Write;
+use std::sync::{Arc, Mutex};
 
-use hashbrown::HashSet as HbHashSet;
 use hashbrown::HashMap as HbHashMap;
+use hashbrown::HashSet as HbHashSet;
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use rayon::prelude::*;
-use indicatif::{ProgressBar, ProgressStyle, MultiProgress};
 use serde::Serialize;
- 
-use crate::board::{Board};
+
+use crate::board::Board;
 use crate::cards::CardsDb;
 use crate::engine::apply::apply_move;
 use crate::engine::score::score;
 use crate::hash::{recompute_zobrist, zobrist_key};
 use crate::rules::Rules;
-use crate::state::{GameState, legal_moves};
-use crate::types::{Owner};
+use crate::state::{legal_moves, GameState};
+use crate::types::Owner;
 
-use crate::solver::graph_writer::GraphJsonlSink;
 use sha2::{Digest, Sha256};
-use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 
 /// When set to true the module will suppress progress bars (use hidden bars).
 /// Set from the CLI driver (precompute) before invoking export routines.
@@ -61,7 +60,8 @@ impl PackedState {
     pub fn to_state(&self, initial_a: [u16; 5], initial_b: [u16; 5]) -> GameState {
         // Build multiset counts of how many of each initial card remain for each player
         fn to_counts(hand: [u16; 5]) -> hashbrown::HashMap<u16, u8, FastHasher> {
-            let mut m: hashbrown::HashMap<u16, u8, FastHasher> = hashbrown::HashMap::with_hasher(FastHasher::default());
+            let mut m: hashbrown::HashMap<u16, u8, FastHasher> =
+                hashbrown::HashMap::with_hasher(FastHasher::default());
             for id in hand {
                 if id != 0 {
                     *m.entry(id).or_insert(0) += 1;
@@ -142,7 +142,10 @@ impl SharedVisited {
         for _ in 0..sc {
             shards.push(Mutex::new(HbHashSet::with_hasher(FastHasher::default())));
         }
-        Self { shards, mask: sc - 1 }
+        Self {
+            shards,
+            mask: sc - 1,
+        }
     }
 
     #[inline]
@@ -160,10 +163,7 @@ impl SharedVisited {
 
     /// Rough count across shards (not precise).
     pub fn len_approx(&self) -> usize {
-        self.shards
-            .iter()
-            .map(|m| m.lock().unwrap().len())
-            .sum()
+        self.shards.iter().map(|m| m.lock().unwrap().len()).sum()
     }
 }
 
@@ -251,6 +251,22 @@ struct RetroEntry {
     best_move: Option<crate::state::Move>,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct RetrogradeFallbackCounts {
+    child_lookup_misses: u64,
+    no_legal_moves_fallbacks: u64,
+    no_child_evaluated_fallbacks: u64,
+}
+
+#[inline]
+fn terminal_value_side_to_move(state: &GameState) -> i8 {
+    let mut v = score(state);
+    if state.next == Owner::B {
+        v = -v;
+    }
+    v
+}
+
 #[inline]
 fn extract_initial_hands(initial: &GameState) -> ([u16; 5], [u16; 5]) {
     let mut a: [u16; 5] = [0; 5];
@@ -269,7 +285,11 @@ fn extract_initial_hands(initial: &GameState) -> ([u16; 5], [u16; 5]) {
 ///   but avoids HashMap allocations and zobrist recomputation.
 /// - Complexity: O(9*5) worst-case, deterministic for duplicated ids (A is preferred).
 #[inline]
-pub fn fast_hands_from_board(board: &Board, initial_a: [u16; 5], initial_b: [u16; 5]) -> (Vec<u16>, Vec<u16>) {
+pub fn fast_hands_from_board(
+    board: &Board,
+    initial_a: [u16; 5],
+    initial_b: [u16; 5],
+) -> (Vec<u16>, Vec<u16>) {
     // Make mutable local copies of the small fixed arrays
     let mut a = initial_a;
     let mut b = initial_b;
@@ -373,32 +393,51 @@ pub fn fast_hands_into(
 
 /// Phase B: exact retrograde solve, assuming full-depth enumeration to ply 9.
 /// Returns per-depth hashmaps of (zobrist -> RetroEntry) for depths 0..9.
-fn retrograde_solve(
+fn retrograde_solve<F>(
     initial: &GameState,
     cards: &CardsDb,
     buckets: &GraphBuckets,
-) -> Vec<HbHashMap<u128, RetroEntry, FastHasher>> {
+    mut progress_for_depth: F,
+) -> (
+    Vec<HbHashMap<u128, RetroEntry, FastHasher>>,
+    RetrogradeFallbackCounts,
+)
+where
+    F: FnMut(u8, u64) -> ProgressBar,
+{
     let (initial_a, initial_b) = extract_initial_hands(initial);
 
+    let child_lookup_misses = AtomicU64::new(0);
+    let no_legal_moves_fallbacks = AtomicU64::new(0);
+    let no_child_evaluated_fallbacks = AtomicU64::new(0);
+
     // Per-depth value maps for fast child lookup and entries maps for best_move
-    let mut entries_by_depth: Vec<HbHashMap<u128, RetroEntry, FastHasher>> =
-        (0..10).map(|_| HbHashMap::with_hasher(FastHasher::default())).collect();
+    let mut entries_by_depth: Vec<HbHashMap<u128, RetroEntry, FastHasher>> = (0..10)
+        .map(|_| HbHashMap::with_hasher(FastHasher::default()))
+        .collect();
 
     // Depth 9: terminals
     // Build depth-9 map from a parallel Vec, then insert (hashbrown HashMap does not implement FromParallelIterator)
+    let pb9 = progress_for_depth(9, buckets.layers[9].len() as u64);
     let computed9: Vec<(u128, RetroEntry)> = buckets.layers[9]
         .par_iter()
         .map(|(key, packed)| {
             let s = packed.to_state(initial_a, initial_b);
             debug_assert!(s.is_terminal(), "Non-terminal at depth 9 encountered");
-            let mut v = score(&s);
-            if s.next == Owner::B {
-                v = -v;
-            }
-            (*key, RetroEntry { value: v, best_move: None })
+            let v = terminal_value_side_to_move(&s);
+            pb9.inc(1);
+            (
+                *key,
+                RetroEntry {
+                    value: v,
+                    best_move: None,
+                },
+            )
         })
         .collect();
-    let mut map9: HbHashMap<u128, RetroEntry, FastHasher> = HbHashMap::with_hasher(FastHasher::default());
+    pb9.finish_and_clear();
+    let mut map9: HbHashMap<u128, RetroEntry, FastHasher> =
+        HbHashMap::with_hasher(FastHasher::default());
     map9.reserve(computed9.len());
     for (k, e) in computed9 {
         map9.insert(k, e);
@@ -409,6 +448,7 @@ fn retrograde_solve(
     for d in (0..=8).rev() {
         let child_map = &entries_by_depth[d + 1];
         let layer = &buckets.layers[d];
+        let pbd = progress_for_depth(d as u8, layer.len() as u64);
 
         // Compute entries for layer d in parallel, then collect
         let computed: Vec<(u128, RetroEntry)> = layer
@@ -419,11 +459,16 @@ fn retrograde_solve(
                 // There should be legal moves when not terminal; however handle empty defensively
                 if moves.is_empty() {
                     // Treat as terminal fallback
-                    let mut v = score(&s);
-                    if s.next == Owner::B {
-                        v = -v;
-                    }
-                    return (*key, RetroEntry { value: v, best_move: None });
+                    no_legal_moves_fallbacks.fetch_add(1, AtomicOrdering::Relaxed);
+                    let v = terminal_value_side_to_move(&s);
+                    pbd.inc(1);
+                    return (
+                        *key,
+                        RetroEntry {
+                            value: v,
+                            best_move: None,
+                        },
+                    );
                 }
 
                 let mut best_val: Option<i8> = None;
@@ -434,54 +479,31 @@ fn retrograde_solve(
                     if let Ok(ns) = apply_move(&s, cards, mv) {
                         let ck = zobrist_key(&ns);
                         if let Some(child) = child_map.get(&ck) {
-                            let cv = child.value;
-                            match (s.next, best_val) {
-                                (Owner::A, None) => {
+                            let cv = -child.value;
+                            match best_val {
+                                None => {
                                     best_val = Some(cv);
                                     best_mv = Some(mv);
                                 }
-                                (Owner::A, Some(cur)) => {
+                                Some(cur) => {
                                     if cv > cur {
                                         best_val = Some(cv);
                                         best_mv = Some(mv);
                                     }
                                     // tie: keep first encountered to satisfy lexicographic order
                                 }
-                                (Owner::B, None) => {
-                                    best_val = Some(cv);
-                                    best_mv = Some(mv);
-                                }
-                                (Owner::B, Some(cur)) => {
-                                    if cv < cur {
-                                        best_val = Some(cv);
-                                        best_mv = Some(mv);
-                                    }
-                                    // tie: keep first encountered
-                                }
                             }
                         } else {
                             // Child not found: this indicates an enumeration gap; fall back to terminal eval
-                            let mut v = score(&ns);
-                            if ns.next == Owner::B {
-                                v = -v;
-                            }
-                            match (s.next, best_val) {
-                                (Owner::A, None) => {
+                            child_lookup_misses.fetch_add(1, AtomicOrdering::Relaxed);
+                            let v = -terminal_value_side_to_move(&ns);
+                            match best_val {
+                                None => {
                                     best_val = Some(v);
                                     best_mv = Some(mv);
                                 }
-                                (Owner::A, Some(cur)) => {
+                                Some(cur) => {
                                     if v > cur {
-                                        best_val = Some(v);
-                                        best_mv = Some(mv);
-                                    }
-                                }
-                                (Owner::B, None) => {
-                                    best_val = Some(v);
-                                    best_mv = Some(mv);
-                                }
-                                (Owner::B, Some(cur)) => {
-                                    if v < cur {
                                         best_val = Some(v);
                                         best_mv = Some(mv);
                                     }
@@ -491,21 +513,32 @@ fn retrograde_solve(
                     }
                 }
 
-                let (val, bm) = (best_val.unwrap_or_else(|| {
-                    // If no child evaluated (shouldn't happen), fallback to terminal-like eval
-                    let mut v = score(&s);
-                    if s.next == Owner::B {
-                        v = -v;
-                    }
-                    v
-                }), best_mv);
+                let (val, bm) = (
+                    best_val.unwrap_or_else(|| {
+                        // If no child evaluated (shouldn't happen), fallback to terminal-like eval
+                        no_child_evaluated_fallbacks.fetch_add(1, AtomicOrdering::Relaxed);
+                        terminal_value_side_to_move(&s)
+                    }),
+                    best_mv,
+                );
 
-                (*key, RetroEntry { value: val, best_move: bm })
+                pbd.inc(1);
+
+                (
+                    *key,
+                    RetroEntry {
+                        value: val,
+                        best_move: bm,
+                    },
+                )
             })
             .collect();
 
+        pbd.finish_and_clear();
+
         // Build depth map
-        let mut map: HbHashMap<u128, RetroEntry, FastHasher> = HbHashMap::with_hasher(FastHasher::default());
+        let mut map: HbHashMap<u128, RetroEntry, FastHasher> =
+            HbHashMap::with_hasher(FastHasher::default());
         map.reserve(computed.len());
         for (k, e) in computed {
             map.insert(k, e);
@@ -513,7 +546,15 @@ fn retrograde_solve(
         entries_by_depth[d] = map;
     }
 
-    entries_by_depth
+    (
+        entries_by_depth,
+        RetrogradeFallbackCounts {
+            child_lookup_misses: child_lookup_misses.load(AtomicOrdering::Relaxed),
+            no_legal_moves_fallbacks: no_legal_moves_fallbacks.load(AtomicOrdering::Relaxed),
+            no_child_evaluated_fallbacks: no_child_evaluated_fallbacks
+                .load(AtomicOrdering::Relaxed),
+        },
+    )
 }
 
 /// Phase A + Phase B entrypoint:
@@ -601,14 +642,13 @@ pub fn graph_precompute_export(
     } else {
         let pb = ProgressBar::new_spinner();
         pb.set_style(
-            ProgressStyle::with_template("[{elapsed_precise}] enumerate {spinner} {msg}")
-                .unwrap()
+            ProgressStyle::with_template("[{elapsed_precise}] enumerate {spinner} {msg}").unwrap(),
         );
         pb.enable_steady_tick(std::time::Duration::from_millis(120));
         pb.set_message(format!("starting (remaining plies = {})", rem_full));
         pb
     };
- 
+
     let t_en = std::time::Instant::now();
     let buckets = if cfg!(feature = "fast_tests") {
         // Fast-tests feature: construct a minimal buckets set containing only the initial PackedState.
@@ -621,7 +661,7 @@ pub fn graph_precompute_export(
         enumerate_graph(initial, cards, Some(rem_full))
     };
     let en_elapsed = t_en.elapsed();
- 
+
     let mut total = 0usize;
     for d in 0..=9 {
         let n = buckets.layers[d].len();
@@ -629,135 +669,41 @@ pub fn graph_precompute_export(
         eprintln!("[graph] depth {}: {}", d, n);
     }
     en_pb.finish_and_clear();
-    eprintln!("[graph] enumeration done: states={} elapsed_ms={}", total, en_elapsed.as_millis());
- 
+    eprintln!(
+        "[graph] enumeration done: states={} elapsed_ms={}",
+        total,
+        en_elapsed.as_millis()
+    );
+
     // Sanity: depth 9 must be terminals
     if buckets.layers[9].is_empty() {
         return Err("Graph enumeration did not reach depth 9; cannot retrograde solve".into());
     }
- 
+
     // Retrograde exact solve (with per-depth progress bars)
-    let entries_by_depth = {
-        let mp = MultiProgress::new();
-
-        // Depth 9 progress
-        {
-            let total9 = buckets.layers[9].len() as u64;
-            let pb9 = if GRAPH_QUIET.load(AtomicOrdering::Relaxed) {
-                mp.add(ProgressBar::hidden())
-            } else {
-                let pb = mp.add(ProgressBar::new(total9));
-                pb.set_style(
-                    ProgressStyle::with_template("[{elapsed_precise}] retro d=9 {bar:40.cyan/blue} {pos}/{len}")
-                        .unwrap()
-                        .progress_chars("=>-")
-                );
-                pb
-            };
-            // Build map with a per-item tick via a temporary collection
-            let (initial_a, initial_b) = extract_initial_hands(initial);
-            let computed9: Vec<(u128, RetroEntry)> = buckets.layers[9]
-                .par_iter()
-                .map(|(key, packed)| {
-                    let s = packed.to_state(initial_a, initial_b);
-                    debug_assert!(s.is_terminal(), "Non-terminal at depth 9 encountered");
-                    let mut v = score(&s);
-                    if s.next == Owner::B {
-                        v = -v;
-                    }
-                    pb9.inc(1);
-                    (*key, RetroEntry { value: v, best_move: None })
-                })
-                .collect();
-            pb9.finish_and_clear();
-
-            // Seed entries_by_depth with depth 9 content
-            let mut entries_by_depth: Vec<HbHashMap<u128, RetroEntry, FastHasher>> =
-                (0..10).map(|_| HbHashMap::with_hasher(FastHasher::default())).collect();
-            let mut map9: HbHashMap<u128, RetroEntry, FastHasher> = HbHashMap::with_hasher(FastHasher::default());
-            map9.reserve(computed9.len());
-            for (k, e) in computed9 {
-                map9.insert(k, e);
-            }
-            entries_by_depth[9] = map9;
-
-            // Depths 8..0 with progress bars
-            for d in (0..=8).rev() {
-                let layer_len = buckets.layers[d].len() as u64;
-                let pbd = mp.add(ProgressBar::new(layer_len));
-                pbd.set_style(
-                    ProgressStyle::with_template(&format!("[{{elapsed_precise}}] retro d={} {{bar:40.cyan/blue}} {{pos}}/{{len}}", d))
-                        .unwrap()
-                        .progress_chars("=>-")
-                );
-                let child_map = &entries_by_depth[d + 1];
-                let layer = &buckets.layers[d];
-                let (initial_a, initial_b) = extract_initial_hands(initial);
-
-                let computed: Vec<(u128, RetroEntry)> = layer
-                    .par_iter()
-                    .map(|(key, packed)| {
-                        let s = packed.to_state(initial_a, initial_b);
-                        let moves = s.legal_moves();
-                        if moves.is_empty() {
-                            let mut v = score(&s);
-                            if s.next == Owner::B {
-                                v = -v;
-                            }
-                            pbd.inc(1);
-                            return (*key, RetroEntry { value: v, best_move: None });
-                        }
-                        let mut best_val: Option<i8> = None;
-                        let mut best_mv: Option<crate::state::Move> = None;
-                        for mv in moves {
-                            if let Ok(ns) = apply_move(&s, cards, mv) {
-                                let ck = zobrist_key(&ns);
-                                let v = if let Some(child) = child_map.get(&ck) {
-                                    child.value
-                                } else {
-                                    // Fallback: should be rare; compute terminal-like
-                                    let mut tv = score(&ns);
-                                    if ns.next == Owner::B {
-                                        tv = -tv;
-                                    }
-                                    tv
-                                };
-                                match (s.next, best_val) {
-                                    (Owner::A, None) => { best_val = Some(v); best_mv = Some(mv); }
-                                    (Owner::A, Some(cur)) => {
-                                        if v > cur { best_val = Some(v); best_mv = Some(mv); }
-                                    }
-                                    (Owner::B, None) => { best_val = Some(v); best_mv = Some(mv); }
-                                    (Owner::B, Some(cur)) => {
-                                        if v < cur { best_val = Some(v); best_mv = Some(mv); }
-                                    }
-                                }
-                            }
-                        }
-                        pbd.inc(1);
-                        let val = best_val.unwrap_or_else(|| {
-                            let mut v = score(&s);
-                            if s.next == Owner::B {
-                                v = -v;
-                            }
-                            v
-                        });
-                        (*key, RetroEntry { value: val, best_move: best_mv })
-                    })
-                    .collect();
-
-                let mut map: HbHashMap<u128, RetroEntry, FastHasher> = HbHashMap::with_hasher(FastHasher::default());
-                map.reserve(computed.len());
-                for (k, e) in computed {
-                    map.insert(k, e);
-                }
-                entries_by_depth[d] = map;
-                pbd.finish_and_clear();
-            }
-
-            entries_by_depth
+    let mp = MultiProgress::new();
+    let quiet = GRAPH_QUIET.load(AtomicOrdering::Relaxed);
+    let (entries_by_depth, retro_counts) = retrograde_solve(initial, cards, &buckets, |d, len| {
+        if quiet {
+            return mp.add(ProgressBar::hidden());
         }
-    };
+        let pb = mp.add(ProgressBar::new(len));
+        pb.set_style(
+            ProgressStyle::with_template(&format!(
+                "[{{elapsed_precise}}] retro d={} {{bar:40.cyan/blue}} {{pos}}/{{len}}",
+                d
+            ))
+            .unwrap()
+            .progress_chars("=>-"),
+        );
+        pb
+    });
+    eprintln!(
+        "[graph] retrograde fallbacks: child_lookup_misses={} no_legal_moves={} no_child_evaluated={}",
+        retro_counts.child_lookup_misses,
+        retro_counts.no_legal_moves_fallbacks,
+        retro_counts.no_child_evaluated_fallbacks,
+    );
 
     // Root summary
     let root_key = zobrist_key(initial);
@@ -790,7 +736,13 @@ pub fn graph_precompute_export(
             for cell in 0u8..9 {
                 let slot = packed.board.get(cell);
                 let (card_id, owner) = match slot {
-                    Some(s) => (Some(s.card_id), Some(match s.owner { Owner::A => 'A', Owner::B => 'B' })),
+                    Some(s) => (
+                        Some(s.card_id),
+                        Some(match s.owner {
+                            Owner::A => 'A',
+                            Owner::B => 'B',
+                        }),
+                    ),
                     None => (None, None),
                 };
                 let element_field: Option<Option<char>> = if elemental_enabled {
@@ -798,23 +750,43 @@ pub fn graph_precompute_export(
                 } else {
                     None
                 };
-                board_vec.push(ExportBoardCell { cell, card_id, owner, element: element_field });
+                board_vec.push(ExportBoardCell {
+                    cell,
+                    card_id,
+                    owner,
+                    element: element_field,
+                });
             }
 
             // to_move and turn/state_idx come from PackedState / layer depth
-            let to_move = match packed.next { Owner::A => 'A', Owner::B => 'B' };
+            let to_move = match packed.next {
+                Owner::A => 'A',
+                Owner::B => 'B',
+            };
 
             // Lookup retrograde entry for this state (should be present)
-            let entry = map.get(key).copied().unwrap_or(RetroEntry { value: 0, best_move: None });
+            let entry = map.get(key).copied().unwrap_or(RetroEntry {
+                value: 0,
+                best_move: None,
+            });
 
             // policy_target present only when d < 9 (non-terminal)
             let policy_target = if d < 9 {
-                entry.best_move.map(|m| ExportPolicy::Move { card_id: m.card_id, cell: m.cell })
+                entry.best_move.map(|m| ExportPolicy::Move {
+                    card_id: m.card_id,
+                    cell: m.cell,
+                })
             } else {
                 None
             };
 
-            let vt = if entry.value > 0 { 1 } else if entry.value < 0 { -1 } else { 0 };
+            let vt = if entry.value > 0 {
+                1
+            } else if entry.value < 0 {
+                -1
+            } else {
+                0
+            };
 
             let line = ExportLine {
                 game_id: 0,
@@ -851,6 +823,9 @@ pub struct GraphExportOutcome {
     pub totals_states: u64,
     pub totals_terminals: u64,
     pub logical_checksum_hex: String,
+    pub retro_child_lookup_misses: u64,
+    pub retro_no_legal_moves_fallbacks: u64,
+    pub retro_no_child_evaluated_fallbacks: u64,
 }
 
 pub fn graph_precompute_export_with_sink(
@@ -880,13 +855,15 @@ pub fn graph_precompute_export_with_sink(
         let mut totals_terminals: u64 = 0;
         let mut hasher = Sha256::new();
 
-        // Initial hands for reconstruction (empty sets)
-        let (initial_a, initial_b) = extract_initial_hands(initial);
-
         for d in 0..=9 {
             // Build a minimal ExportLine equivalent used in normal export
             let board_vec: Vec<ExportBoardCell> = (0u8..9u8)
-                .map(|cell| ExportBoardCell { cell, card_id: None, owner: None, element: None })
+                .map(|cell| ExportBoardCell {
+                    cell,
+                    card_id: None,
+                    owner: None,
+                    element: None,
+                })
                 .collect();
 
             let ha: Vec<u16> = Vec::new();
@@ -900,7 +877,10 @@ pub fn graph_precompute_export_with_sink(
                 state_idx: d as u8,
                 board: board_vec,
                 hands: ExportHands { a: ha, b: hb },
-                to_move: match initial.next { Owner::A => 'A', Owner::B => 'B' },
+                to_move: match initial.next {
+                    Owner::A => 'A',
+                    Owner::B => 'B',
+                },
                 turn: d as u8,
                 rules: initial.rules,
                 policy_target,
@@ -921,7 +901,9 @@ pub fn graph_precompute_export_with_sink(
 
             totals_by_depth[d] = 1;
             totals_states = totals_states.saturating_add(1);
-            if d == 9 { totals_terminals = totals_terminals.saturating_add(1); }
+            if d == 9 {
+                totals_terminals = totals_terminals.saturating_add(1);
+            }
         }
 
         let logical_checksum_hex = hex::encode(hasher.finalize());
@@ -930,6 +912,9 @@ pub fn graph_precompute_export_with_sink(
             totals_states,
             totals_terminals,
             logical_checksum_hex,
+            retro_child_lookup_misses: 0,
+            retro_no_legal_moves_fallbacks: 0,
+            retro_no_child_evaluated_fallbacks: 0,
         });
     }
 
@@ -939,8 +924,7 @@ pub fn graph_precompute_export_with_sink(
     } else {
         let pb = ProgressBar::new_spinner();
         pb.set_style(
-            ProgressStyle::with_template("[{elapsed_precise}] enumerate {spinner} {msg}")
-                .unwrap()
+            ProgressStyle::with_template("[{elapsed_precise}] enumerate {spinner} {msg}").unwrap(),
         );
         pb.enable_steady_tick(std::time::Duration::from_millis(120));
         pb.set_message(format!("starting (remaining plies = {})", rem_full));
@@ -968,7 +952,11 @@ pub fn graph_precompute_export_with_sink(
         eprintln!("[graph] depth {}: {}", d, n);
     }
     en_pb.finish_and_clear();
-    eprintln!("[graph] enumeration done: states={} elapsed_ms={}", totals_states, en_elapsed.as_millis());
+    eprintln!(
+        "[graph] enumeration done: states={} elapsed_ms={}",
+        totals_states,
+        en_elapsed.as_millis()
+    );
 
     // Sanity: depth 9 must be terminals
     if buckets.layers[9].is_empty() {
@@ -977,132 +965,29 @@ pub fn graph_precompute_export_with_sink(
     let totals_terminals: u64 = buckets.layers[9].len() as u64;
 
     // Retrograde exact solve (with per-depth progress bars)
-    let entries_by_depth = {
-        let mp = MultiProgress::new();
-
-        // Depth 9 progress
-        {
-            let total9 = buckets.layers[9].len() as u64;
-            let pb9 = if GRAPH_QUIET.load(AtomicOrdering::Relaxed) {
-                mp.add(ProgressBar::hidden())
-            } else {
-                let pb = mp.add(ProgressBar::new(total9));
-                pb.set_style(
-                    ProgressStyle::with_template("[{elapsed_precise}] retro d=9 {bar:40.cyan/blue} {pos}/{len}")
-                        .unwrap()
-                        .progress_chars("=>-")
-                );
-                pb
-            };
-            // Build map with a per-item tick via a temporary collection
-            let (initial_a, initial_b) = extract_initial_hands(initial);
-            let computed9: Vec<(u128, RetroEntry)> = buckets.layers[9]
-                .par_iter()
-                .map(|(key, packed)| {
-                    let s = packed.to_state(initial_a, initial_b);
-                    debug_assert!(s.is_terminal(), "Non-terminal at depth 9 encountered");
-                    let mut v = score(&s);
-                    if s.next == Owner::B {
-                        v = -v;
-                    }
-                    pb9.inc(1);
-                    (*key, RetroEntry { value: v, best_move: None })
-                })
-                .collect();
-            pb9.finish_and_clear();
-
-            // Seed entries_by_depth with depth 9 content
-            let mut entries_by_depth: Vec<HbHashMap<u128, RetroEntry, FastHasher>> =
-                (0..10).map(|_| HbHashMap::with_hasher(FastHasher::default())).collect();
-            let mut map9: HbHashMap<u128, RetroEntry, FastHasher> = HbHashMap::with_hasher(FastHasher::default());
-            map9.reserve(computed9.len());
-            for (k, e) in computed9 {
-                map9.insert(k, e);
-            }
-            entries_by_depth[9] = map9;
-
-            // Depths 8..0 with progress bars
-            for d in (0..=8).rev() {
-                let layer_len = buckets.layers[d].len() as u64;
-                let pbd = if GRAPH_QUIET.load(AtomicOrdering::Relaxed) {
-                    mp.add(ProgressBar::hidden())
-                } else {
-                    let pb = mp.add(ProgressBar::new(layer_len));
-                    pb.set_style(
-                        ProgressStyle::with_template(&format!("[{{elapsed_precise}}] retro d={} {{bar:40.cyan/blue}} {{pos}}/{{len}}", d))
-                            .unwrap()
-                            .progress_chars("=>-")
-                    );
-                    pb
-                };
-                let child_map = &entries_by_depth[d + 1];
-                let layer = &buckets.layers[d];
-                let (initial_a, initial_b) = extract_initial_hands(initial);
-
-                let computed: Vec<(u128, RetroEntry)> = layer
-                    .par_iter()
-                    .map(|(key, packed)| {
-                        let s = packed.to_state(initial_a, initial_b);
-                        let moves = s.legal_moves();
-                        if moves.is_empty() {
-                            let mut v = score(&s);
-                            if s.next == Owner::B {
-                                v = -v;
-                            }
-                            pbd.inc(1);
-                            return (*key, RetroEntry { value: v, best_move: None });
-                        }
-                        let mut best_val: Option<i8> = None;
-                        let mut best_mv: Option<crate::state::Move> = None;
-                        for mv in moves {
-                            if let Ok(ns) = apply_move(&s, cards, mv) {
-                                let ck = zobrist_key(&ns);
-                                let v = if let Some(child) = child_map.get(&ck) {
-                                    child.value
-                                } else {
-                                    // Fallback: should be rare; compute terminal-like
-                                    let mut tv = score(&ns);
-                                    if ns.next == Owner::B {
-                                        tv = -tv;
-                                    }
-                                    tv
-                                };
-                                match (s.next, best_val) {
-                                    (Owner::A, None) => { best_val = Some(v); best_mv = Some(mv); }
-                                    (Owner::A, Some(cur)) => {
-                                        if v > cur { best_val = Some(v); best_mv = Some(mv); }
-                                    }
-                                    (Owner::B, None) => { best_val = Some(v); best_mv = Some(mv); }
-                                    (Owner::B, Some(cur)) => {
-                                        if v < cur { best_val = Some(v); best_mv = Some(mv); }
-                                    }
-                                }
-                            }
-                        }
-                        pbd.inc(1);
-                        let val = best_val.unwrap_or_else(|| {
-                            let mut v = score(&s);
-                            if s.next == Owner::B {
-                                v = -v;
-                            }
-                            v
-                        });
-                        (*key, RetroEntry { value: val, best_move: best_mv })
-                    })
-                    .collect();
-
-                let mut map: HbHashMap<u128, RetroEntry, FastHasher> = HbHashMap::with_hasher(FastHasher::default());
-                map.reserve(computed.len());
-                for (k, e) in computed {
-                    map.insert(k, e);
-                }
-                entries_by_depth[d] = map;
-                pbd.finish_and_clear();
-            }
-
-            entries_by_depth
+    let mp = MultiProgress::new();
+    let quiet = GRAPH_QUIET.load(AtomicOrdering::Relaxed);
+    let (entries_by_depth, retro_counts) = retrograde_solve(initial, cards, &buckets, |d, len| {
+        if quiet {
+            return mp.add(ProgressBar::hidden());
         }
-    };
+        let pb = mp.add(ProgressBar::new(len));
+        pb.set_style(
+            ProgressStyle::with_template(&format!(
+                "[{{elapsed_precise}}] retro d={} {{bar:40.cyan/blue}} {{pos}}/{{len}}",
+                d
+            ))
+            .unwrap()
+            .progress_chars("=>-"),
+        );
+        pb
+    });
+    eprintln!(
+        "[graph] retrograde fallbacks: child_lookup_misses={} no_legal_moves={} no_child_evaluated={}",
+        retro_counts.child_lookup_misses,
+        retro_counts.no_legal_moves_fallbacks,
+        retro_counts.no_child_evaluated_fallbacks,
+    );
 
     // Root summary
     let root_key = zobrist_key(initial);
@@ -1127,9 +1012,11 @@ pub fn graph_precompute_export_with_sink(
     } else {
         let pb = ProgressBar::new(totals_states);
         pb.set_style(
-            ProgressStyle::with_template("[{elapsed_precise}] write {bar:40.cyan/blue} {pos}/{len}")
-                .unwrap()
-                .progress_chars("=>-"),
+            ProgressStyle::with_template(
+                "[{elapsed_precise}] write {bar:40.cyan/blue} {pos}/{len}",
+            )
+            .unwrap()
+            .progress_chars("=>-"),
         );
         pb
     };
@@ -1146,7 +1033,13 @@ pub fn graph_precompute_export_with_sink(
             // Fast hands reconstruction into reusable buffers (avoid allocating small Vecs each iteration)
             let mut ha_buf: Vec<u16> = Vec::with_capacity(5);
             let mut hb_buf: Vec<u16> = Vec::with_capacity(5);
-            fast_hands_into(&packed.board, initial_a, initial_b, &mut ha_buf, &mut hb_buf);
+            fast_hands_into(
+                &packed.board,
+                initial_a,
+                initial_b,
+                &mut ha_buf,
+                &mut hb_buf,
+            );
 
             // Board cells (reuse board_buf to avoid allocation per state)
             board_buf.clear();
@@ -1154,7 +1047,13 @@ pub fn graph_precompute_export_with_sink(
             for cell in 0u8..9 {
                 let slot = packed.board.get(cell);
                 let (card_id, owner) = match slot {
-                    Some(s) => (Some(s.card_id), Some(match s.owner { Owner::A => 'A', Owner::B => 'B' })),
+                    Some(s) => (
+                        Some(s.card_id),
+                        Some(match s.owner {
+                            Owner::A => 'A',
+                            Owner::B => 'B',
+                        }),
+                    ),
                     None => (None, None),
                 };
                 let element_field: Option<Option<char>> = if elemental_enabled {
@@ -1162,30 +1061,53 @@ pub fn graph_precompute_export_with_sink(
                 } else {
                     None
                 };
-                board_buf.push(ExportBoardCell { cell, card_id, owner, element: element_field });
+                board_buf.push(ExportBoardCell {
+                    cell,
+                    card_id,
+                    owner,
+                    element: element_field,
+                });
             }
 
             // to_move and turn/state_idx come from PackedState / layer depth
-            let to_move = match packed.next { Owner::A => 'A', Owner::B => 'B' };
+            let to_move = match packed.next {
+                Owner::A => 'A',
+                Owner::B => 'B',
+            };
 
             // Lookup retrograde entry for this state (use default fallback if missing)
-            let entry = map.get(key).copied().unwrap_or(RetroEntry { value: 0, best_move: None });
+            let entry = map.get(key).copied().unwrap_or(RetroEntry {
+                value: 0,
+                best_move: None,
+            });
 
             // policy_target present only when d < 9 (non-terminal)
             let policy_target = if d < 9 {
-                entry.best_move.map(|m| ExportPolicy::Move { card_id: m.card_id, cell: m.cell })
+                entry.best_move.map(|m| ExportPolicy::Move {
+                    card_id: m.card_id,
+                    cell: m.cell,
+                })
             } else {
                 None
             };
 
-            let vt = if entry.value > 0 { 1 } else if entry.value < 0 { -1 } else { 0 };
+            let vt = if entry.value > 0 {
+                1
+            } else if entry.value < 0 {
+                -1
+            } else {
+                0
+            };
 
             // Use the reusable buffers; cloning small Vecs (9 elems / <=5 elems) is cheap and avoids allocations.
             let line = ExportLine {
                 game_id: 0,
                 state_idx: d as u8,
                 board: board_buf.clone(),
-                hands: ExportHands { a: ha_buf.clone(), b: hb_buf.clone() },
+                hands: ExportHands {
+                    a: ha_buf.clone(),
+                    b: hb_buf.clone(),
+                },
                 to_move,
                 turn: d as u8,
                 rules: packed.rules,
@@ -1222,13 +1144,16 @@ pub fn graph_precompute_export_with_sink(
     }
     write_pb.finish_and_clear();
     eprintln!("[graph] export lines written: {}", lines_written);
-    
+
     let logical_checksum_hex = hex::encode(hasher.finalize());
-    
+
     Ok(GraphExportOutcome {
         totals_by_depth,
         totals_states,
         totals_terminals,
         logical_checksum_hex,
+        retro_child_lookup_misses: retro_counts.child_lookup_misses,
+        retro_no_legal_moves_fallbacks: retro_counts.no_legal_moves_fallbacks,
+        retro_no_child_evaluated_fallbacks: retro_counts.no_child_evaluated_fallbacks,
     })
 }
