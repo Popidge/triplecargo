@@ -3,7 +3,7 @@ use std::fs::File;
 use std::io::{self, BufWriter, Write};
 use std::thread;
 
-use crossbeam_channel::{bounded, Sender, Receiver};
+use crossbeam_channel::{bounded, Receiver, Sender};
 use std::collections::BTreeMap;
 
 /// Default buffer size for BufWriter in graph JSONL sinks (32 MiB)
@@ -110,35 +110,35 @@ impl<'a> Write for HashingFileWrite<'a> {
 pub struct ZstdFramesJsonlWriter {
     nodes: BufWriter<File>,
     idx: Option<BufWriter<File>>,
- 
+
     hasher_nodes: Sha256,
     hasher_idx: Option<Sha256>,
- 
+
     // Tracks total compressed bytes written so far (for index offsets).
     compressed_pos: u64,
- 
+
     // Accumulator for one frame worth of JSONL (uncompressed)
     frame_buf: Vec<u8>,
     frame_lines_target: usize,
     frame_max_bytes: usize,
     frame_lines_count: usize,
- 
+
     // Running counters
     total_lines: u64,
     frame_count: u64,
     global_line_cursor: u64, // next line number to assign as line_start for a new frame
- 
+
     // Per-frame stats
     cur_turn_min: Option<u8>,
     cur_turn_max: Option<u8>,
- 
+
     // Compression config
     zstd_level: i32,
     zstd_threads: usize,
- 
+
     // Final fsync policy
     sync_final: bool,
- 
+
     // Whether to compute/emit SHA256 digests
     hashing: bool,
 }
@@ -231,7 +231,9 @@ impl ZstdFramesJsonlWriter {
         }
 
         self.frame_count = self.frame_count.saturating_add(1);
-        self.total_lines = self.total_lines.saturating_add(self.frame_lines_count as u64);
+        self.total_lines = self
+            .total_lines
+            .saturating_add(self.frame_lines_count as u64);
         self.global_line_cursor = self
             .global_line_cursor
             .saturating_add(self.frame_lines_count as u64);
@@ -243,7 +245,7 @@ impl ZstdFramesJsonlWriter {
         self.cur_turn_max = None;
 
         Ok(())
-        }
+    }
 }
 
 impl GraphJsonlSink for ZstdFramesJsonlWriter {
@@ -274,7 +276,9 @@ impl GraphJsonlSink for ZstdFramesJsonlWriter {
         }
 
         // Check flush conditions
-        if self.frame_lines_count >= self.frame_lines_target || self.frame_buf.len() >= self.frame_max_bytes {
+        if self.frame_lines_count >= self.frame_lines_target
+            || self.frame_buf.len() >= self.frame_max_bytes
+        {
             self.flush_frame()?;
         }
 
@@ -299,7 +303,7 @@ impl GraphJsonlSink for ZstdFramesJsonlWriter {
 
         let nodes_digest = std::mem::take(&mut self.hasher_nodes).finalize();
         let index_digest = self.hasher_idx.take().map(|h| hex::encode(h.finalize()));
-    
+
         Ok(GraphSinkStats {
             total_lines: self.total_lines,
             frame_count: self.frame_count,
@@ -399,8 +403,10 @@ impl AsyncZstdFramesJsonlWriter {
         if workers == 0 {
             // Single-stage path: writer compresses and writes
             let join = thread::spawn(move || -> io::Result<WriterOutcome> {
-                let mut nodes = BufWriter::with_capacity(buf_bytes.max(8 * 1024 * 1024), nodes_file);
-                let mut idx = idx_file.map(|f| BufWriter::with_capacity(buf_bytes.max(1024 * 1024), f));
+                let mut nodes =
+                    BufWriter::with_capacity(buf_bytes.max(8 * 1024 * 1024), nodes_file);
+                let mut idx =
+                    idx_file.map(|f| BufWriter::with_capacity(buf_bytes.max(1024 * 1024), f));
                 let mut hasher_nodes = Sha256::new();
                 let mut hasher_idx = idx.as_ref().map(|_| Sha256::new());
                 let mut compressed_pos: u64 = 0;
@@ -419,7 +425,10 @@ impl AsyncZstdFramesJsonlWriter {
                                     pos: &mut compressed_pos,
                                     hashing: hashing_local,
                                 };
-                                let mut encoder = zstd::stream::write::Encoder::new(&mut counting_writer, zstd_level)?;
+                                let mut encoder = zstd::stream::write::Encoder::new(
+                                    &mut counting_writer,
+                                    zstd_level,
+                                )?;
                                 let _ = encoder.multithread(zstd_threads.max(1) as u32);
                                 encoder.write_all(&f.uncompressed)?;
                                 let _ = encoder.finish();
@@ -433,7 +442,8 @@ impl AsyncZstdFramesJsonlWriter {
                                     "turn_min": f.turn_min,
                                     "turn_max": f.turn_max
                                 });
-                                let mut tmp = serde_json::to_vec(&line).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                                let mut tmp = serde_json::to_vec(&line)
+                                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
                                 tmp.push(b'\n');
                                 idxw.write_all(&tmp)?;
                                 if hashing_local {
@@ -497,8 +507,11 @@ impl AsyncZstdFramesJsonlWriter {
                         match msg {
                             FrameMsg::Data(f) => {
                                 // Compress into memory buffer
-                                let mut dst: Vec<u8> = Vec::with_capacity(f.uncompressed.len() / 4 + 1024);
-                                if let Ok(mut encoder) = zstd::stream::write::Encoder::new(&mut dst, zstd_level) {
+                                let mut dst: Vec<u8> =
+                                    Vec::with_capacity(f.uncompressed.len() / 4 + 1024);
+                                if let Ok(mut encoder) =
+                                    zstd::stream::write::Encoder::new(&mut dst, zstd_level)
+                                {
                                     let _ = encoder.multithread(zstd_threads.max(1) as u32);
                                     let _ = encoder.write_all(&f.uncompressed);
                                     let _ = encoder.finish();
@@ -525,8 +538,10 @@ impl AsyncZstdFramesJsonlWriter {
 
             // Writer thread: preserve order by id
             let join = thread::spawn(move || -> io::Result<WriterOutcome> {
-                let mut nodes = BufWriter::with_capacity(buf_bytes.max(8 * 1024 * 1024), nodes_file);
-                let mut idx = idx_file.map(|f| BufWriter::with_capacity(buf_bytes.max(1024 * 1024), f));
+                let mut nodes =
+                    BufWriter::with_capacity(buf_bytes.max(8 * 1024 * 1024), nodes_file);
+                let mut idx =
+                    idx_file.map(|f| BufWriter::with_capacity(buf_bytes.max(1024 * 1024), f));
                 let mut hasher_nodes = Sha256::new();
                 let mut hasher_idx = idx.as_ref().map(|_| Sha256::new());
                 let mut compressed_pos: u64 = 0;
@@ -558,7 +573,8 @@ impl AsyncZstdFramesJsonlWriter {
                                         "turn_min": cf.turn_min,
                                         "turn_max": cf.turn_max
                                     });
-                                    let mut tmp = serde_json::to_vec(&line).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                                    let mut tmp = serde_json::to_vec(&line)
+                                        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
                                     tmp.push(b'\n');
                                     idxw.write_all(&tmp)?;
                                     h.update(&tmp);
@@ -639,7 +655,9 @@ impl AsyncZstdFramesJsonlWriter {
         };
         // advance producer counters deterministically
         self.next_frame_id = self.next_frame_id.saturating_add(1);
-        self.global_line_cursor = self.global_line_cursor.saturating_add(self.frame_lines_count as u64);
+        self.global_line_cursor = self
+            .global_line_cursor
+            .saturating_add(self.frame_lines_count as u64);
         self.frame_lines_count = 0;
         self.cur_turn_min = None;
         self.cur_turn_max = None;
@@ -676,7 +694,9 @@ impl GraphJsonlSink for AsyncZstdFramesJsonlWriter {
             }
         }
 
-        if self.frame_lines_count >= self.frame_lines_target || self.frame_buf.len() >= self.frame_max_bytes {
+        if self.frame_lines_count >= self.frame_lines_target
+            || self.frame_buf.len() >= self.frame_max_bytes
+        {
             self.emit_frame()?;
         }
         Ok(())
@@ -701,9 +721,9 @@ impl GraphJsonlSink for AsyncZstdFramesJsonlWriter {
 
         // join writer and return stats
         let handle = self.writer_join.take().expect("writer join present");
-        let outcome = handle.join().map_err(|_| {
-            io::Error::new(io::ErrorKind::Other, "writer thread panicked")
-        })??;
+        let outcome = handle
+            .join()
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, "writer thread panicked"))??;
 
         Ok(GraphSinkStats {
             total_lines: outcome.total_lines,
@@ -744,13 +764,13 @@ pub struct AsyncShardedZstdFramesJsonlWriter {
     cur_turn_max: Option<u8>,
     next_frame_id: u64,
     global_line_cursor: u64,
- 
+
     // channel to coordinator
     tx: Sender<FrameMsg>,
- 
+
     // join handle for the coordinator
     writer_join: Option<thread::JoinHandle<io::Result<ShardedWriterOutcome>>>,
- 
+
     // shard count and final fsync policy (retained for coordinator use)
     shards: usize,
     sync_final: bool,
@@ -786,7 +806,8 @@ impl AsyncShardedZstdFramesJsonlWriter {
             let mut compressed_pos: Vec<u64> = vec![0u64; shards];
 
             // Shared index writer + hasher
-            let mut idx_writer = idx_file.map(|f| BufWriter::with_capacity(buf_bytes.max(1024 * 1024), f));
+            let mut idx_writer =
+                idx_file.map(|f| BufWriter::with_capacity(buf_bytes.max(1024 * 1024), f));
             let mut hasher_idx = idx_writer.as_ref().map(|_| Sha256::new());
 
             let mut total_lines: u64 = 0;
@@ -797,7 +818,7 @@ impl AsyncShardedZstdFramesJsonlWriter {
                     FrameMsg::Data(f) => {
                         let shard = (f.id as usize) % shards;
                         let offset = compressed_pos[shard];
- 
+
                         // Compress frame into corresponding shard writer while hashing and counting
                         {
                             let mut counting_writer = HashingFileWrite {
@@ -806,12 +827,15 @@ impl AsyncShardedZstdFramesJsonlWriter {
                                 pos: &mut compressed_pos[shard],
                                 hashing,
                             };
-                            let mut encoder = zstd::stream::write::Encoder::new(&mut counting_writer, zstd_level)?;
+                            let mut encoder = zstd::stream::write::Encoder::new(
+                                &mut counting_writer,
+                                zstd_level,
+                            )?;
                             let _ = encoder.multithread(zstd_threads.max(1) as u32);
                             encoder.write_all(&f.uncompressed)?;
                             let _ = encoder.finish();
                         }
- 
+
                         // Emit one index line to shared index with shard field and global frame id
                         if let (Some(idxw), Some(h)) = (idx_writer.as_mut(), hasher_idx.as_mut()) {
                             let line = serde_json::json!({
@@ -823,14 +847,15 @@ impl AsyncShardedZstdFramesJsonlWriter {
                                 "turn_min": f.turn_min,
                                 "turn_max": f.turn_max
                             });
-                            let mut tmp = serde_json::to_vec(&line).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                            let mut tmp = serde_json::to_vec(&line)
+                                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
                             tmp.push(b'\n');
                             idxw.write_all(&tmp)?;
                             if hashing {
                                 h.update(&tmp);
                             }
                         }
- 
+
                         frame_count = frame_count.saturating_add(1);
                         total_lines = total_lines.saturating_add(f.line_count as u64);
                     }
@@ -917,7 +942,9 @@ impl AsyncShardedZstdFramesJsonlWriter {
         };
 
         self.next_frame_id = self.next_frame_id.saturating_add(1);
-        self.global_line_cursor = self.global_line_cursor.saturating_add(self.frame_lines_count as u64);
+        self.global_line_cursor = self
+            .global_line_cursor
+            .saturating_add(self.frame_lines_count as u64);
         self.frame_lines_count = 0;
         self.cur_turn_min = None;
         self.cur_turn_max = None;
@@ -953,7 +980,9 @@ impl GraphJsonlSink for AsyncShardedZstdFramesJsonlWriter {
             }
         }
 
-        if self.frame_lines_count >= self.frame_lines_target || self.frame_buf.len() >= self.frame_max_bytes {
+        if self.frame_lines_count >= self.frame_lines_target
+            || self.frame_buf.len() >= self.frame_max_bytes
+        {
             self.emit_frame()?;
         }
         Ok(())
@@ -964,20 +993,33 @@ impl GraphJsonlSink for AsyncShardedZstdFramesJsonlWriter {
         self.emit_frame()?;
 
         // signal end
-        self.tx
-            .send(FrameMsg::End)
-            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "sharded writer channel closed"))?;
+        self.tx.send(FrameMsg::End).map_err(|_| {
+            io::Error::new(io::ErrorKind::BrokenPipe, "sharded writer channel closed")
+        })?;
 
         // join coordinator
-        let handle = self.writer_join.take().expect("sharded writer join present");
-        let outcome = handle.join().map_err(|_| io::Error::new(io::ErrorKind::Other, "sharded writer thread panicked"))??;
+        let handle = self
+            .writer_join
+            .take()
+            .expect("sharded writer join present");
+        let outcome = handle.join().map_err(|_| {
+            io::Error::new(io::ErrorKind::Other, "sharded writer thread panicked")
+        })??;
 
         Ok(GraphSinkStats {
             total_lines: outcome.total_lines,
             frame_count: outcome.frame_count,
-            nodes_sha256_hex: if self.hashing { outcome.nodes_sha256_list.get(0).cloned() } else { None },
+            nodes_sha256_hex: if self.hashing {
+                outcome.nodes_sha256_list.get(0).cloned()
+            } else {
+                None
+            },
             index_sha256_hex: outcome.index_sha256_hex,
-            nodes_sha256_list: if self.hashing { Some(outcome.nodes_sha256_list) } else { None },
+            nodes_sha256_list: if self.hashing {
+                Some(outcome.nodes_sha256_list)
+            } else {
+                None
+            },
         })
     }
 }

@@ -4,10 +4,10 @@ use serde::Deserialize;
 use std::io::Write;
 use std::process::{Command, Stdio};
 
-use triplecargo::{Rules, GameState, zobrist_key};
 use triplecargo::cards::load_cards_from_json;
 use triplecargo::solver::search_root;
 use triplecargo::solver::tt_array::FixedTT;
+use triplecargo::{zobrist_key, GameState, Rules};
 
 #[derive(Deserialize)]
 struct EvalMoveOut {
@@ -58,7 +58,13 @@ fn test_eval_known_pv_matches_solver() {
     let depth = 9 - state.board.filled_count();
     let mut tt = FixedTT::with_capacity_pow2(FixedTT::capacity_for_budget_bytes(8 * 1024 * 1024));
     let (val, bm, _nodes) = search_root(&state, &cards, depth, &mut tt);
-    let expected_value = if val > 0 { 1 } else if val < 0 { -1 } else { 0 };
+    let expected_value = if val > 0 {
+        1
+    } else if val < 0 {
+        -1
+    } else {
+        0
+    };
     let expected_bm = bm.expect("non-terminal opening must have a best move");
 
     // Prepare JSON input matching export schema subset
@@ -83,29 +89,51 @@ fn test_eval_known_pv_matches_solver() {
             "plus": false,
             "same_wall": false
         }
-    }).to_string();
+    })
+    .to_string();
 
     // Run CLI
-    let output = run_with_stdin(&input_json, &["--eval-state", "--cards", "data/cards.json", "--tt-bytes", "8"]);
+    let output = run_with_stdin(
+        &input_json,
+        &[
+            "--eval-state",
+            "--cards",
+            "data/cards.json",
+            "--tt-bytes",
+            "8",
+        ],
+    );
     assert!(output.status.success(), "process must succeed");
     let stdout = String::from_utf8(output.stdout.clone()).expect("utf8 stdout");
 
     // Exactly one JSON object line
-    assert!(predicate::str::is_match(r#"^\{.*\}\r?\n?$"#).unwrap().eval(&stdout));
-    assert!(!String::from_utf8(output.stderr.clone()).unwrap().contains("[eval]"));
+    assert!(predicate::str::is_match(r#"^\{.*\}\r?\n?$"#)
+        .unwrap()
+        .eval(&stdout));
+    assert!(!String::from_utf8(output.stderr.clone())
+        .unwrap()
+        .contains("[eval]"));
 
     // Parse stdout JSON
     let eval: EvalOut = serde_json::from_str(&stdout).expect("json parse output");
 
     // Validate
-    assert_eq!(eval.value, expected_value, "win/draw/loss value must match solver");
-    let bm_out = eval.best_move.expect("best_move must be present at non-terminal");
+    assert_eq!(
+        eval.value, expected_value,
+        "win/draw/loss value must match solver"
+    );
+    let bm_out = eval
+        .best_move
+        .expect("best_move must be present at non-terminal");
     assert_eq!(bm_out.card_id, expected_bm.card_id);
     assert_eq!(bm_out.cell, expected_bm.cell);
 
     // Validate state_hash
     let expected_hash = format!("{:032x}", zobrist_key(&state));
-    assert_eq!(eval.state_hash, expected_hash, "state_hash must match zobrist of input state");
+    assert_eq!(
+        eval.state_hash, expected_hash,
+        "state_hash must match zobrist of input state"
+    );
     assert_eq!(eval.depth, depth);
 }
 
@@ -127,11 +155,30 @@ fn test_eval_determinism_two_runs_identical() {
       "to_move": "A",
       "turn": 0,
       "rules": { "elemental": false, "same": false, "plus": false, "same_wall": false }
-    }).to_string();
+    })
+    .to_string();
 
-    let out1 = run_with_stdin(&input_json, &["--eval-state", "--cards", "data/cards.json", "--tt-bytes", "8"]);
+    let out1 = run_with_stdin(
+        &input_json,
+        &[
+            "--eval-state",
+            "--cards",
+            "data/cards.json",
+            "--tt-bytes",
+            "8",
+        ],
+    );
     assert!(out1.status.success(), "run1 must succeed");
-    let out2 = run_with_stdin(&input_json, &["--eval-state", "--cards", "data/cards.json", "--tt-bytes", "8"]);
+    let out2 = run_with_stdin(
+        &input_json,
+        &[
+            "--eval-state",
+            "--cards",
+            "data/cards.json",
+            "--tt-bytes",
+            "8",
+        ],
+    );
     assert!(out2.status.success(), "run2 must succeed");
 
     let s1 = String::from_utf8(out1.stdout).unwrap();
@@ -158,7 +205,8 @@ fn test_eval_terminal_state_omits_best_move() {
       "to_move": "A",
       "turn": 9,
       "rules": { "elemental": false, "same": false, "plus": false, "same_wall": false }
-    }).to_string();
+    })
+    .to_string();
 
     let output = run_with_stdin(&input_json, &["--eval-state", "--cards", "data/cards.json"]);
     assert!(output.status.success(), "terminal eval must succeed");
@@ -166,7 +214,10 @@ fn test_eval_terminal_state_omits_best_move() {
     let eval: serde_json::Value = serde_json::from_str(&s).expect("json");
 
     // best_move must be absent
-    assert!(eval.get("best_move").is_none(), "best_move must be omitted at terminal");
+    assert!(
+        eval.get("best_move").is_none(),
+        "best_move must be omitted at terminal"
+    );
 }
 
 #[test]
@@ -175,5 +226,9 @@ fn test_eval_invalid_json_exit_1() {
     let output = run_with_stdin(bad, &["--eval-state", "--cards", "data/cards.json"]);
     assert!(!output.status.success(), "invalid json must fail");
     let err = String::from_utf8(output.stderr).unwrap();
-    assert!(err.to_lowercase().contains("invalid json") || err.to_lowercase().contains("error"), "stderr should contain parse error, got: {}", err);
+    assert!(
+        err.to_lowercase().contains("invalid json") || err.to_lowercase().contains("error"),
+        "stderr should contain parse error, got: {}",
+        err
+    );
 }

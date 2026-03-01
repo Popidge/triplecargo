@@ -2,23 +2,24 @@ use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc};
-use std::sync::atomic::{Ordering, AtomicU64};
 use std::time::Instant;
 
 use clap::{Parser, ValueEnum};
 use indicatif::{ProgressBar, ProgressStyle};
 use rand::Rng;
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 use serde_json;
 use std::io::{self, BufRead};
 use std::process;
 
-use triplecargo::{
-    load_cards_from_json, zobrist_key, Element, GameState, Owner, Rules, apply_move, legal_moves, score, rng_for_state,
-    solver::{search_root, search_root_with_children},
-};
 use triplecargo::solver::tt_array::FixedTT;
+use triplecargo::{
+    apply_move, legal_moves, load_cards_from_json, rng_for_state, score,
+    solver::{search_root, search_root_with_children},
+    zobrist_key, Element, GameState, Owner, Rules,
+};
 
 #[derive(Debug, Clone, ValueEnum)]
 enum ElementsOpt {
@@ -43,6 +44,14 @@ enum ExportModeOpt {
 enum PolicyFormatOpt {
     Onehot,
     Mcts,
+    #[clap(name = "soft_exact", alias = "soft-exact")]
+    SoftExact,
+}
+
+#[derive(Debug, Clone, ValueEnum)]
+enum SoftExactQModeOpt {
+    Margin,
+    Winloss,
 }
 
 #[derive(Debug, Clone, ValueEnum)]
@@ -75,7 +84,10 @@ enum PlayStrategyOpt {
 }
 
 #[derive(Debug, Parser)]
-#[command(name = "precompute_new", about = "Triplecargo export driver (parallel skeleton)")]
+#[command(
+    name = "precompute_new",
+    about = "Triplecargo export driver (parallel skeleton)"
+)]
 struct Args {
     /// Rules toggles as comma-separated list: elemental,same,plus,same_wall (or 'none')
     #[arg(long, default_value = "none")]
@@ -112,22 +124,38 @@ struct Args {
     /// Number of worker threads for export (default: available_parallelism-1, min 1)
     #[arg(long)]
     threads: Option<usize>,
-    
+
     /// Chunk size per worker request (number of games fetched at once). If omitted, defaults to min(32, max(1, games/threads)).
     #[arg(long = "chunk-size")]
     chunk_size: Option<usize>,
-    
+
     /// Hand sampling strategy: random | stratified
     #[arg(long, value_enum, default_value_t = HandStrategyOpt::Random)]
     hand_strategy: HandStrategyOpt,
 
-    /// Policy export format: onehot | mcts
+    /// Policy export format: onehot | mcts | soft_exact
     #[arg(long, value_enum, default_value_t = PolicyFormatOpt::Onehot)]
     policy_format: PolicyFormatOpt,
 
     /// Rollouts for MCTS policy (only used when --policy-format mcts)
     #[arg(long, default_value_t = 100)]
     mcts_rollouts: usize,
+
+    /// Temperature for soft_exact policy (only used when --policy-format soft_exact)
+    #[arg(long = "soft-exact-temperature", default_value_t = 0.5)]
+    soft_exact_temperature: f64,
+
+    /// Q transform mode for soft_exact policy: margin | winloss
+    #[arg(long = "soft-exact-qmode", value_enum, default_value_t = SoftExactQModeOpt::Margin)]
+    soft_exact_qmode: SoftExactQModeOpt,
+
+    /// Keep only top-k actions by q before softmax (disabled when omitted)
+    #[arg(long = "soft-exact-topk")]
+    soft_exact_topk: Option<usize>,
+
+    /// Epsilon floor applied to included soft_exact probabilities before renormalization
+    #[arg(long = "soft-exact-epsilon", default_value_t = 0.0)]
+    soft_exact_epsilon: f64,
 
     /// Off-PV sampling rate [0.0..1.0] (0 disables)
     #[arg(long, default_value_t = 0.0)]
@@ -212,13 +240,16 @@ struct Args {
     graph_elements: Option<String>,
 
     // ---- Graph mode compression and indexing flags ----
-
     /// Enable zstd compression of node streams (default: true)
     #[arg(long = "zstd", default_value_t = true)]
     zstd: bool,
 
     /// Alias for disabling compression (equivalent to --zstd=false)
-    #[arg(long = "no-compress", default_value_t = false, visible_alias = "nocompress")]
+    #[arg(
+        long = "no-compress",
+        default_value_t = false,
+        visible_alias = "nocompress"
+    )]
     no_compress: bool,
 
     /// Zstd compression level (1..=10, default 3)
@@ -236,7 +267,7 @@ struct Args {
     /// Target maximum uncompressed bytes per zstd frame (soft cap; default: 128 MiB)
     #[arg(long = "zstd-frame-bytes", default_value_t = 134217728)]
     zstd_frame_bytes: usize,
- 
+
     /// Emit nodes.idx.jsonl (one line per frame) when zstd is enabled (default: true)
     #[arg(long = "zstd-index", default_value_t = true)]
     zstd_index: bool,
@@ -332,15 +363,51 @@ struct HandsRecord {
     b: Vec<u16>,
 }
 
+#[derive(Debug, Serialize, Clone, Copy)]
+struct ActionMoveOut {
+    action_id: u8,
+    card_id: u16,
+    cell: u8,
+}
+
+#[derive(Debug, Serialize)]
+struct SoftExactEntryOut {
+    action_id: u8,
+    p: f64,
+}
+
+#[derive(Debug, Serialize)]
+struct SoftExactPolicyOut {
+    format: &'static str,
+    action_space: &'static str,
+    temperature: f64,
+    qmode: &'static str,
+    entries: Vec<SoftExactEntryOut>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct GeneratorMeta {
+    git_sha: String,
+    command_line: String,
+    seed: u64,
+    ruleset: String,
+    export_mode: String,
+    policy_format: String,
+    value_mode: String,
+}
+
 #[derive(Serialize)]
 #[serde(untagged)]
 enum PolicyOut {
-    Move { card_id: u16, cell: u8 },
+    Move(ActionMoveOut),
     Dist(BTreeMap<String, f32>),
+    SoftExact(SoftExactPolicyOut),
 }
 
 #[derive(Serialize)]
 struct ExportRecord {
+    schema_version: u8,
+    generator: GeneratorMeta,
     game_id: usize,
     state_idx: u8,
     board: Vec<BoardCell>,
@@ -348,6 +415,13 @@ struct ExportRecord {
     to_move: char,
     turn: u8,
     rules: Rules,
+    legal_moves_mask: Vec<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    best_move: Option<ActionMoveOut>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    action_taken: Option<ActionMoveOut>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    best_action_id: Option<u8>,
     #[serde(skip_serializing_if = "Option::is_none")]
     policy_target: Option<PolicyOut>,
     value_target: i8,
@@ -361,9 +435,14 @@ struct ExportConfig {
     policy_format: PolicyFormatOpt,
     value_mode: ValueModeOpt,
     mcts_rollouts: usize,
+    soft_exact_temperature: f64,
+    soft_exact_qmode: SoftExactQModeOpt,
+    soft_exact_topk: Option<usize>,
+    soft_exact_epsilon: f64,
     off_pv_rate: f32,
     off_pv_strategy: OffPvStrategyOpt,
     base_seed: u64,
+    generator: GeneratorMeta,
 }
 
 // Helpers for sampling
@@ -435,17 +514,270 @@ fn value_mode_str(vm: &ValueModeOpt) -> &'static str {
 }
 
 #[inline]
+fn policy_format_str(pf: &PolicyFormatOpt) -> &'static str {
+    match pf {
+        PolicyFormatOpt::Onehot => "onehot",
+        PolicyFormatOpt::Mcts => "mcts",
+        PolicyFormatOpt::SoftExact => "soft_exact",
+    }
+}
+
+#[inline]
+fn export_mode_str(mode: &ExportModeOpt) -> &'static str {
+    match mode {
+        ExportModeOpt::Trajectory => "trajectory",
+        ExportModeOpt::Full => "full",
+        ExportModeOpt::Graph => "graph",
+    }
+}
+
+#[inline]
+fn ruleset_str(rules: Rules) -> String {
+    format!(
+        "elemental={},same={},plus={},same_wall={}",
+        rules.elemental as u8, rules.same as u8, rules.plus as u8, rules.same_wall as u8,
+    )
+}
+
+#[inline]
+fn soft_exact_qmode_str(mode: &SoftExactQModeOpt) -> &'static str {
+    match mode {
+        SoftExactQModeOpt::Margin => "margin",
+        SoftExactQModeOpt::Winloss => "winloss",
+    }
+}
+
+fn stable_command_line(args: &Args, rules: Rules) -> String {
+    let mut parts: Vec<String> = vec![
+        "precompute".to_string(),
+        format!("--rules {}", ruleset_str(rules)),
+        format!("--elements {:?}", args.elements).to_lowercase(),
+        format!("--seed {}", args.seed),
+        format!("--export-mode {}", export_mode_str(&args.export_mode)),
+        format!("--policy-format {}", policy_format_str(&args.policy_format)),
+        format!("--value-mode {}", value_mode_str(&args.value_mode)),
+    ];
+    if matches!(args.policy_format, PolicyFormatOpt::Mcts) {
+        parts.push(format!("--mcts-rollouts {}", args.mcts_rollouts));
+    }
+    if matches!(args.policy_format, PolicyFormatOpt::SoftExact) {
+        parts.push(format!(
+            "--soft-exact-temperature {:.12}",
+            args.soft_exact_temperature
+        ));
+        parts.push(format!(
+            "--soft-exact-qmode {}",
+            soft_exact_qmode_str(&args.soft_exact_qmode)
+        ));
+        if let Some(k) = args.soft_exact_topk {
+            parts.push(format!("--soft-exact-topk {}", k));
+        }
+        parts.push(format!(
+            "--soft-exact-epsilon {:.12}",
+            args.soft_exact_epsilon
+        ));
+    }
+    parts.join(" ")
+}
+
+fn action_id_for_move(state: &GameState, mv: triplecargo::Move) -> Result<u8, String> {
+    if mv.cell >= 9 {
+        return Err(format!("invalid cell {} for action mapping", mv.cell));
+    }
+    let hand = state.current_hand();
+    let mut found: Option<usize> = None;
+    for (idx, slot) in hand.iter().enumerate() {
+        if *slot == Some(mv.card_id) {
+            if found.is_some() {
+                return Err(format!(
+                    "ambiguous action mapping: duplicate card_id {} in hand for side {:?}",
+                    mv.card_id, state.next
+                ));
+            }
+            found = Some(idx);
+        }
+    }
+    let idx = found.ok_or_else(|| {
+        format!(
+            "action mapping failed: card_id {} not found in current hand for side {:?}",
+            mv.card_id, state.next
+        )
+    })?;
+    Ok((idx as u8) * 9 + mv.cell)
+}
+
+#[inline]
+fn action_move_out(state: &GameState, mv: triplecargo::Move) -> Result<ActionMoveOut, String> {
+    Ok(ActionMoveOut {
+        action_id: action_id_for_move(state, mv)?,
+        card_id: mv.card_id,
+        cell: mv.cell,
+    })
+}
+
+fn legal_moves_mask_45(state: &GameState) -> Vec<u8> {
+    let mut mask = vec![0u8; 45];
+    let hand = state.current_hand();
+    for (slot_idx, card_opt) in hand.iter().enumerate() {
+        if card_opt.is_none() {
+            continue;
+        }
+        for cell in 0u8..9 {
+            if state.board.is_empty(cell) {
+                let action_id = slot_idx * 9 + (cell as usize);
+                mask[action_id] = 1;
+            }
+        }
+    }
+    mask
+}
+
+fn soft_exact_policy_from_children(
+    state: &GameState,
+    child_vals: &[(triplecargo::Move, i8)],
+    temperature: f64,
+    qmode: &SoftExactQModeOpt,
+    topk: Option<usize>,
+    epsilon: f64,
+) -> Result<(SoftExactPolicyOut, Option<u8>), String> {
+    let mut q_entries: Vec<(u8, f64)> = Vec::with_capacity(child_vals.len());
+    for (mv, v) in child_vals.iter().copied() {
+        let action_id = action_id_for_move(state, mv)?;
+        let q = match qmode {
+            SoftExactQModeOpt::Margin => v as f64,
+            SoftExactQModeOpt::Winloss => {
+                if v > 0 {
+                    1.0
+                } else if v < 0 {
+                    -1.0
+                } else {
+                    0.0
+                }
+            }
+        };
+        q_entries.push((action_id, q));
+    }
+    if q_entries.is_empty() {
+        return Ok((
+            SoftExactPolicyOut {
+                format: "soft_exact",
+                action_space: "slot_cell_45",
+                temperature,
+                qmode: soft_exact_qmode_str(qmode),
+                entries: Vec::new(),
+            },
+            None,
+        ));
+    }
+
+    q_entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut best_action_id = q_entries[0].0;
+    let mut best_q = q_entries[0].1;
+    for (aid, q) in q_entries.iter().copied() {
+        if q > best_q || (q == best_q && aid < best_action_id) {
+            best_q = q;
+            best_action_id = aid;
+        }
+    }
+
+    if let Some(k) = topk {
+        if k == 0 {
+            q_entries.clear();
+        } else if k < q_entries.len() {
+            q_entries.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            q_entries.truncate(k);
+            q_entries.sort_by(|a, b| a.0.cmp(&b.0));
+        }
+    }
+
+    if q_entries.is_empty() {
+        return Ok((
+            SoftExactPolicyOut {
+                format: "soft_exact",
+                action_space: "slot_cell_45",
+                temperature,
+                qmode: soft_exact_qmode_str(qmode),
+                entries: Vec::new(),
+            },
+            Some(best_action_id),
+        ));
+    }
+
+    let inv_t = 1.0_f64 / temperature;
+    let mut logits: Vec<(u8, f64)> = q_entries
+        .iter()
+        .map(|(aid, q)| (*aid, *q * inv_t))
+        .collect();
+    let max_logit = logits
+        .iter()
+        .map(|(_, l)| *l)
+        .fold(f64::NEG_INFINITY, f64::max);
+    for (_, l) in logits.iter_mut() {
+        *l -= max_logit;
+    }
+
+    let mut probs: Vec<(u8, f64)> = logits.iter().map(|(aid, l)| (*aid, l.exp())).collect();
+    let mut z = probs.iter().map(|(_, p)| *p).sum::<f64>();
+    if !z.is_finite() || z <= 0.0 {
+        let uniform = 1.0 / (probs.len() as f64);
+        for (_, p) in probs.iter_mut() {
+            *p = uniform;
+        }
+    } else {
+        for (_, p) in probs.iter_mut() {
+            *p /= z;
+        }
+    }
+
+    if epsilon > 0.0 {
+        for (_, p) in probs.iter_mut() {
+            if *p < epsilon {
+                *p = epsilon;
+            }
+        }
+        z = probs.iter().map(|(_, p)| *p).sum::<f64>();
+        if z > 0.0 && z.is_finite() {
+            for (_, p) in probs.iter_mut() {
+                *p /= z;
+            }
+        }
+    }
+
+    probs.sort_by(|a, b| a.0.cmp(&b.0));
+    let entries = probs
+        .into_iter()
+        .map(|(action_id, p)| SoftExactEntryOut { action_id, p })
+        .collect();
+
+    Ok((
+        SoftExactPolicyOut {
+            format: "soft_exact",
+            action_space: "slot_cell_45",
+            temperature,
+            qmode: soft_exact_qmode_str(qmode),
+            entries,
+        },
+        Some(best_action_id),
+    ))
+}
+
+#[inline]
 fn compute_value_target(vm: &ValueModeOpt, side_value: i8, to_move: Owner) -> i8 {
     match vm {
         ValueModeOpt::Winloss => {
-            if side_value > 0 { 1 } else if side_value < 0 { -1 } else { 0 }
-        }
-        ValueModeOpt::Margin => {
-            match to_move {
-                Owner::A => side_value,
-                Owner::B => -side_value,
+            if side_value > 0 {
+                1
+            } else if side_value < 0 {
+                -1
+            } else {
+                0
             }
         }
+        ValueModeOpt::Margin => match to_move {
+            Owner::A => side_value,
+            Owner::B => -side_value,
+        },
     }
 }
 
@@ -489,7 +821,11 @@ fn mcts_policy_distribution(
             let mut best = f64::NEG_INFINITY;
             for i in 0..n {
                 let ci = counts[i].max(1) as f64;
-                let mean = if counts[i] == 0 { 0.0 } else { sums[i] / (counts[i] as f64) };
+                let mean = if counts[i] == 0 {
+                    0.0
+                } else {
+                    sums[i] / (counts[i] as f64)
+                };
                 let ucb = mean + c * (ln_total / ci).sqrt();
                 if ucb > best {
                     best = ucb;
@@ -514,7 +850,9 @@ fn mcts_policy_distribution(
             let pick = (r as usize) % legals.len();
             let mv = legals[pick];
             match apply_move(&sim, cards, mv) {
-                Ok(ns) => { sim = ns; }
+                Ok(ns) => {
+                    sim = ns;
+                }
                 Err(_) => break,
             }
         }
@@ -582,7 +920,10 @@ fn pick_weighted_non_pv_move(
     if cands.is_empty() {
         return pv;
     }
-    let max_q = cands.iter().map(|(_, q)| *q as f64).fold(f64::NEG_INFINITY, f64::max);
+    let max_q = cands
+        .iter()
+        .map(|(_, q)| *q as f64)
+        .fold(f64::NEG_INFINITY, f64::max);
     let mut weights: Vec<f64> = Vec::with_capacity(cands.len());
     let mut sum_w: f64 = 0.0;
     for &(_, q) in &cands {
@@ -613,7 +954,10 @@ fn parse_move_key(key: &str) -> Option<triplecargo::Move> {
     let cell_s = parts.next()?;
     let card_id: u16 = card_s.parse().ok()?;
     let cell_u: u8 = cell_s.parse().ok()?;
-    Some(triplecargo::Move { card_id, cell: cell_u })
+    Some(triplecargo::Move {
+        card_id,
+        cell: cell_u,
+    })
 }
 
 #[derive(Clone, Copy)]
@@ -640,7 +984,11 @@ fn elemental_delta_local(cell_elem: Option<Element>, card_elem: Option<Element>)
     match cell_elem {
         None => 0,
         Some(e) => {
-            if card_elem == Some(e) { 1 } else { -1 }
+            if card_elem == Some(e) {
+                1
+            } else {
+                -1
+            }
         }
     }
 }
@@ -704,7 +1052,11 @@ fn heuristic_scores_for_legal(
                     // match => +w_element, mismatch or no-element card => -w_element
                     match cards.get(mv.card_id) {
                         Some(c) => {
-                            if c.element == Some(e) { weights.element } else { -weights.element }
+                            if c.element == Some(e) {
+                                weights.element
+                            } else {
+                                -weights.element
+                            }
                         }
                         None => 0.0,
                     }
@@ -720,7 +1072,11 @@ fn heuristic_scores_for_legal(
             Ok(sim) => {
                 let after_score = score(&sim);
                 let delta = (after_score as i16 - before_score as i16) as i8;
-                if to_move == Owner::A { delta as f32 } else { -(delta as f32) }
+                if to_move == Owner::A {
+                    delta as f32
+                } else {
+                    -(delta as f32)
+                }
             }
             Err(_) => 0.0,
         };
@@ -728,7 +1084,8 @@ fn heuristic_scores_for_legal(
         // Defensive exposure: penalize low exposed sides and immediate threats from existing neighbors
         let defense_penalty = match cards.get(mv.card_id) {
             Some(card) => {
-                let placed_sides = adjusted_sides_for_cell_local(card, mv.cell, &state.board, &state.rules);
+                let placed_sides =
+                    adjusted_sides_for_cell_local(card, mv.cell, &state.board, &state.rules);
                 let neighs = state.board.neighbors(mv.cell);
                 let mut pen: f32 = 0.0;
                 for (i, opt_nidx) in neighs.iter().enumerate() {
@@ -739,7 +1096,12 @@ fn heuristic_scores_for_legal(
                                 // If neighbor occupied by opponent, see if its touching side beats ours
                                 if nslot.owner != to_move {
                                     if let Some(nc) = cards.get(nslot.card_id) {
-                                        let nsides = adjusted_sides_for_cell_local(nc, *nidx, &state.board, &state.rules);
+                                        let nsides = adjusted_sides_for_cell_local(
+                                            nc,
+                                            *nidx,
+                                            &state.board,
+                                            &state.rules,
+                                        );
                                         let opp_idx = (i + 2) % 4;
                                         let neigh_side = nsides[opp_idx] as i16;
                                         if neigh_side > our_side {
@@ -762,11 +1124,10 @@ fn heuristic_scores_for_legal(
             None => 0.0,
         };
 
-        let score_total =
-            pos_bonus +
-            weights.greedy * greedy_gain +
-            (-weights.defense) * defense_penalty +
-            elem_bonus;
+        let score_total = pos_bonus
+            + weights.greedy * greedy_gain
+            + (-weights.defense) * defense_penalty
+            + elem_bonus;
 
         scores.push(score_total);
     }
@@ -1037,7 +1398,11 @@ fn pick_mcts_non_pv_move_from_dist(
         best = match best {
             None => Some((mv, p)),
             Some((bmv, bp)) => {
-                if p > bp { Some((mv, p)) } else { Some((bmv, bp)) }
+                if p > bp {
+                    Some((mv, p))
+                } else {
+                    Some((bmv, bp))
+                }
             }
         };
     }
@@ -1083,9 +1448,9 @@ struct ApplyReq {
 struct EvalInput {
     board: Vec<EvalInputCell>,
     hands: EvalInputHands,
-    to_move: char,                   // 'A' | 'B'
+    to_move: char, // 'A' | 'B'
     #[serde(default)]
-    turn: Option<u8>,                // optional; if present must match board filled count
+    turn: Option<u8>, // optional; if present must match board filled count
     rules: Rules,
     // Optional; if present, must match board[].element
     #[serde(default)]
@@ -1105,12 +1470,12 @@ struct EvalMoveOut {
 struct EvalOut {
     #[serde(skip_serializing_if = "Option::is_none")]
     best_move: Option<EvalMoveOut>,
-    value: i8,           // {-1,0,1} from side-to-move perspective
-    margin: i8,          // A_cards − B_cards at terminal
+    value: i8,  // {-1,0,1} from side-to-move perspective
+    margin: i8, // A_cards − B_cards at terminal
     pv: Vec<EvalMoveOut>,
     nodes: u64,
-    depth: u8,           // remaining plies searched
-    state_hash: String,  // 128-bit zobrist hex
+    depth: u8,          // remaining plies searched
+    state_hash: String, // 128-bit zobrist hex
 }
 
 #[derive(Debug, Serialize)]
@@ -1124,10 +1489,10 @@ struct ApplyStateOut {
 
 #[derive(Debug, Serialize)]
 struct OutcomeOut {
-    mode: String,            // "winloss"
-    value: i8,               // {-1,0,1} from A perspective
+    mode: String, // "winloss"
+    value: i8,    // {-1,0,1} from A perspective
     #[serde(skip_serializing_if = "Option::is_none")]
-    winner: Option<char>,    // 'A' | 'B' | null for draw / non-terminal
+    winner: Option<char>, // 'A' | 'B' | null for draw / non-terminal
 }
 
 #[derive(Debug, Serialize)]
@@ -1154,11 +1519,16 @@ fn elem_from_letter(ch: char) -> Result<Element, String> {
         'P' => Ok(Element::Poison),
         'H' => Ok(Element::Holy),
         'L' => Ok(Element::Wind),
-        other => Err(format!("Invalid element letter '{other}' (expected one of F,I,T,W,E,P,H,L)")),
+        other => Err(format!(
+            "Invalid element letter '{other}' (expected one of F,I,T,W,E,P,H,L)"
+        )),
     }
 }
 
-fn build_state_from_eval_input(inp: &EvalInput, cards: &triplecargo::CardsDb) -> Result<GameState, String> {
+fn build_state_from_eval_input(
+    inp: &EvalInput,
+    cards: &triplecargo::CardsDb,
+) -> Result<GameState, String> {
     // Derive per-cell elements from board_elements (preferred) or from board[].element
     let mut derived_from_cells: Option<[Option<Element>; 9]> = None;
     if inp.board.iter().any(|c| c.element.is_some()) {
@@ -1178,7 +1548,10 @@ fn build_state_from_eval_input(inp: &EvalInput, cards: &triplecargo::CardsDb) ->
     let mut from_top: Option<[Option<Element>; 9]> = None;
     if let Some(v) = &inp.board_elements {
         if v.len() != 9 {
-            return Err(format!("board_elements must have length 9, got {}", v.len()));
+            return Err(format!(
+                "board_elements must have length 9, got {}",
+                v.len()
+            ));
         }
         let mut arr: [Option<Element>; 9] = [None; 9];
         for i in 0..9usize {
@@ -1195,7 +1568,10 @@ fn build_state_from_eval_input(inp: &EvalInput, cards: &triplecargo::CardsDb) ->
         (Some(a), Some(b)) => {
             for i in 0..9 {
                 if a[i] != b[i] {
-                    return Err(format!("Element mismatch at cell {} between board_elements and board[].element", i));
+                    return Err(format!(
+                        "Element mismatch at cell {} between board_elements and board[].element",
+                        i
+                    ));
                 }
             }
             Some(a)
@@ -1227,7 +1603,12 @@ fn build_state_from_eval_input(inp: &EvalInput, cards: &triplecargo::CardsDb) ->
             let owner = match owner_ch {
                 'A' => Owner::A,
                 'B' => Owner::B,
-                _ => return Err(format!("Invalid owner '{}' (expected 'A' or 'B')", owner_ch)),
+                _ => {
+                    return Err(format!(
+                        "Invalid owner '{}' (expected 'A' or 'B')",
+                        owner_ch
+                    ))
+                }
             };
             let slot = triplecargo::board::Slot { owner, card_id };
             s.board.set(cell.cell, Some(slot));
@@ -1265,7 +1646,10 @@ fn build_state_from_eval_input(inp: &EvalInput, cards: &triplecargo::CardsDb) ->
     if let Some(t) = inp.turn {
         let filled = s.board.filled_count();
         if t != filled {
-            return Err(format!("turn mismatch: provided {}, but board has {} occupied cells", t, filled));
+            return Err(format!(
+                "turn mismatch: provided {}, but board has {} occupied cells",
+                t, filled
+            ));
         }
     }
 
@@ -1328,7 +1712,10 @@ fn eval_state_main(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
 
         if let Some(app) = inp.apply {
             // Apply request
-            let mv = triplecargo::Move { card_id: app.card_id, cell: app.cell };
+            let mv = triplecargo::Move {
+                card_id: app.card_id,
+                cell: app.cell,
+            };
             match apply_move(&state0, &cards, mv) {
                 Ok(state1) => {
                     // Prepare board vector (include element when elemental is on)
@@ -1337,7 +1724,13 @@ fn eval_state_main(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
                     for cell in 0u8..9 {
                         let slot = state1.board.get(cell);
                         let (card_id, owner): (Option<u16>, Option<char>) = match slot {
-                            Some(s) => (Some(s.card_id), Some(match s.owner { Owner::A => 'A', Owner::B => 'B' })),
+                            Some(s) => (
+                                Some(s.card_id),
+                                Some(match s.owner {
+                                    Owner::A => 'A',
+                                    Owner::B => 'B',
+                                }),
+                            ),
                             None => (None, None),
                         };
                         let element_field: Option<Option<char>> = if elemental_enabled {
@@ -1345,24 +1738,52 @@ fn eval_state_main(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
                         } else {
                             None
                         };
-                        board_vec.push(BoardCell { cell, card_id, owner, element: element_field });
+                        board_vec.push(BoardCell {
+                            cell,
+                            card_id,
+                            owner,
+                            element: element_field,
+                        });
                     }
 
                     // Hands snapshot (compact)
                     let mut ha: Vec<u16> = Vec::with_capacity(5);
                     let mut hb: Vec<u16> = Vec::with_capacity(5);
-                    for &o in state1.hands_a.iter() { if let Some(id) = o { ha.push(id); } }
-                    for &o in state1.hands_b.iter() { if let Some(id) = o { hb.push(id); } }
+                    for &o in state1.hands_a.iter() {
+                        if let Some(id) = o {
+                            ha.push(id);
+                        }
+                    }
+                    for &o in state1.hands_b.iter() {
+                        if let Some(id) = o {
+                            hb.push(id);
+                        }
+                    }
                     let hands = HandsRecord { a: ha, b: hb };
 
-                    let to_move = match state1.next { Owner::A => 'A', Owner::B => 'B' };
+                    let to_move = match state1.next {
+                        Owner::A => 'A',
+                        Owner::B => 'B',
+                    };
                     let turn = state1.board.filled_count();
 
                     let done = state1.is_terminal();
                     let (out_value, winner) = if done {
                         let m = score(&state1);
-                        let v = if m > 0 { 1 } else if m < 0 { -1 } else { 0 };
-                        let w = if m > 0 { Some('A') } else if m < 0 { Some('B') } else { None };
+                        let v = if m > 0 {
+                            1
+                        } else if m < 0 {
+                            -1
+                        } else {
+                            0
+                        };
+                        let w = if m > 0 {
+                            Some('A')
+                        } else if m < 0 {
+                            Some('B')
+                        } else {
+                            None
+                        };
                         (v, w)
                     } else {
                         (0, None)
@@ -1385,13 +1806,21 @@ fn eval_state_main(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
                         state_hash: format!("{:032x}", zobrist_key(&state1)),
                     };
 
-                    println!("{}", serde_json::to_string(&resp).expect("serialize apply json"));
+                    println!(
+                        "{}",
+                        serde_json::to_string(&resp).expect("serialize apply json")
+                    );
                     let _ = io::stdout().flush();
                 }
                 Err(e) => {
                     // Produce an error object for invalid apply without breaking the stream
-                    let err = ErrorOut { error: format!("apply error: {e}") };
-                    println!("{}", serde_json::to_string(&err).expect("serialize error json"));
+                    let err = ErrorOut {
+                        error: format!("apply error: {e}"),
+                    };
+                    println!(
+                        "{}",
+                        serde_json::to_string(&err).expect("serialize error json")
+                    );
                     let _ = io::stdout().flush();
                 }
             }
@@ -1401,7 +1830,8 @@ fn eval_state_main(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
             let (val, bm, nodes) = search_root(&state0, &cards, depth, &mut tt);
 
             // Reconstruct PV up to remaining depth and ensure terminal by continuing perfect play
-            let mut pv_moves = triplecargo::solver::reconstruct_pv(&state0, &cards, &tt, depth as usize);
+            let mut pv_moves =
+                triplecargo::solver::reconstruct_pv(&state0, &cards, &tt, depth as usize);
 
             let mut sim = state0.clone();
             for mv in &pv_moves {
@@ -1433,15 +1863,27 @@ fn eval_state_main(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
 
             let margin = score(&sim);
 
-            let best_move_out = bm.map(|m| EvalMoveOut { card_id: m.card_id, cell: m.cell });
+            let best_move_out = bm.map(|m| EvalMoveOut {
+                card_id: m.card_id,
+                cell: m.cell,
+            });
             let pv_out: Vec<EvalMoveOut> = pv_moves
                 .into_iter()
-                .map(|m| EvalMoveOut { card_id: m.card_id, cell: m.cell })
+                .map(|m| EvalMoveOut {
+                    card_id: m.card_id,
+                    cell: m.cell,
+                })
                 .collect();
 
             let out = EvalOut {
                 best_move: best_move_out, // omitted at terminal
-                value: if val > 0 { 1 } else if val < 0 { -1 } else { 0 },
+                value: if val > 0 {
+                    1
+                } else if val < 0 {
+                    -1
+                } else {
+                    0
+                },
                 margin,
                 pv: pv_out,
                 nodes,
@@ -1453,7 +1895,10 @@ fn eval_state_main(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
                 eprintln!("[eval] nodes={} depth={}", nodes, depth);
             }
 
-            println!("{}", serde_json::to_string(&out).expect("serialize eval json"));
+            println!(
+                "{}",
+                serde_json::to_string(&out).expect("serialize eval json")
+            );
             let _ = io::stdout().flush();
         }
     }
@@ -1469,18 +1914,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let t0 = Instant::now();
- 
+
     // Load cards
     let cards = load_cards_from_json(&args.cards).map_err(|e| format!("Cards load error: {e}"))?;
-    println!("[precompute_new] Loaded {} cards (max id {}).", cards.len(), cards.max_id());
+    println!(
+        "[precompute_new] Loaded {} cards (max id {}).",
+        cards.len(),
+        cards.max_id()
+    );
 
     let rules = parse_rules(&args.rules);
 
+    if matches!(args.policy_format, PolicyFormatOpt::SoftExact) {
+        if !args.soft_exact_temperature.is_finite() || args.soft_exact_temperature <= 0.0 {
+            return Err("--soft-exact-temperature must be finite and > 0".into());
+        }
+        if !args.soft_exact_epsilon.is_finite() || args.soft_exact_epsilon < 0.0 {
+            return Err("--soft-exact-epsilon must be finite and >= 0".into());
+        }
+    }
+
     let Some(export_path) = args.export.as_ref() else {
-        eprintln!("[precompute_new] This binary only supports JSONL export. Re-run with --export PATH");
+        eprintln!(
+            "[precompute_new] This binary only supports JSONL export. Re-run with --export PATH"
+        );
         return Ok(());
     };
-
 
     // Static resources for sampling
     let all_ids_sorted = all_card_ids_sorted(&cards);
@@ -1491,7 +1950,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let written_states = Arc::new(AtomicU64::new(0));
     let policy_info: String = match args.policy_format {
         PolicyFormatOpt::Mcts => format!("mcts@{}", args.mcts_rollouts),
+        PolicyFormatOpt::SoftExact => format!(
+            "soft_exact@T={:.3},q={},topk={},eps={:.6}",
+            args.soft_exact_temperature,
+            soft_exact_qmode_str(&args.soft_exact_qmode),
+            args.soft_exact_topk
+                .map(|k| k.to_string())
+                .unwrap_or_else(|| "all".to_string()),
+            args.soft_exact_epsilon
+        ),
         PolicyFormatOpt::Onehot => "onehot".to_string(),
+    };
+
+    let generator_meta = GeneratorMeta {
+        git_sha: option_env!("GIT_SHA").unwrap_or("unknown").to_string(),
+        command_line: stable_command_line(&args, rules),
+        seed: args.seed,
+        ruleset: ruleset_str(rules),
+        export_mode: export_mode_str(&args.export_mode).to_string(),
+        policy_format: policy_format_str(&args.policy_format).to_string(),
+        value_mode: value_mode_str(&args.value_mode).to_string(),
     };
 
     match args.export_mode {
@@ -1500,9 +1978,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let total_states: u64 = (games as u64) * 9;
             let pb = ProgressBar::new(total_states);
             pb.set_style(
-                ProgressStyle::with_template("[{elapsed_precise}] traj {bar:40.cyan/blue} {pos}/{len} {msg}")
-                    .unwrap()
-                    .progress_chars("=>-"),
+                ProgressStyle::with_template(
+                    "[{elapsed_precise}] traj {bar:40.cyan/blue} {pos}/{len} {msg}",
+                )
+                .unwrap()
+                .progress_chars("=>-"),
             );
             // Progress updater thread: updates PB message with floating rates and ETA every second.
             let pb_updater = pb.clone();
@@ -1511,29 +1991,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let total_states_upd = total_states;
             let policy_info_upd = policy_info.clone();
             let start_instant = Instant::now();
-            std::thread::spawn(move || {
-                loop {
-                    std::thread::sleep(std::time::Duration::from_secs(1));
-                    let elapsed = start_instant.elapsed().as_secs_f64().max(1e-6);
-                    let states_done_u = written_upd.load(Ordering::Relaxed);
-                    let states_done = states_done_u as f64;
-                    let states_per_sec = states_done / elapsed;
-                    let nodes = nodes_upd.load(Ordering::Relaxed) as f64;
-                    let nodes_per_sec = nodes / elapsed;
-                    let nodes_m = nodes / 1.0e6;
-                    let remaining = (total_states_upd.saturating_sub(states_done_u)) as f64;
-                    let eta_secs = if states_per_sec > 1e-9 { (remaining / states_per_sec).round() as u64 } else { 0u64 };
-                    let _nodes_per_sec = nodes / elapsed;
-                    let msg = format!(
-                        "states/s {:.1} | nodes {:.2}M | ETA {} | pol {}",
-                        states_per_sec,
-                        nodes_m,
-                        format_hms(eta_secs),
-                        policy_info_upd,
-                    );
-                    pb_updater.set_position(states_done_u);
-                    pb_updater.set_message(msg);
-                }
+            std::thread::spawn(move || loop {
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                let elapsed = start_instant.elapsed().as_secs_f64().max(1e-6);
+                let states_done_u = written_upd.load(Ordering::Relaxed);
+                let states_done = states_done_u as f64;
+                let states_per_sec = states_done / elapsed;
+                let nodes = nodes_upd.load(Ordering::Relaxed) as f64;
+                let nodes_m = nodes / 1.0e6;
+                let remaining = (total_states_upd.saturating_sub(states_done_u)) as f64;
+                let eta_secs = if states_per_sec > 1e-9 {
+                    (remaining / states_per_sec).round() as u64
+                } else {
+                    0u64
+                };
+                let msg = format!(
+                    "states/s {:.1} | nodes {:.2}M | ETA {} | pol {}",
+                    states_per_sec,
+                    nodes_m,
+                    format_hms(eta_secs),
+                    policy_info_upd,
+                );
+                pb_updater.set_position(states_done_u);
+                pb_updater.set_message(msg);
             });
 
             println!(
@@ -1542,10 +2022,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
 
             // Determine worker count
-            let worker_count = args.threads.unwrap_or_else(|| {
-                let n = std::thread::available_parallelism().map(|nz| nz.get()).unwrap_or(1);
-                if n <= 1 { 1 } else { n.saturating_sub(1) }
-            }).max(1);
+            let worker_count = args
+                .threads
+                .unwrap_or_else(|| {
+                    let n = std::thread::available_parallelism()
+                        .map(|nz| nz.get())
+                        .unwrap_or(1);
+                    if n <= 1 {
+                        1
+                    } else {
+                        n.saturating_sub(1)
+                    }
+                })
+                .max(1);
 
             println!(
                 "[export] trajectory workers={} (default = available_parallelism-1)",
@@ -1562,7 +2051,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("[export] chunk_size={}", effective_chunk_size);
 
             // Create output JSONL file for trajectory export
-            let file = File::create(export_path).map_err(|e| format!("Failed to create export file: {e}"))?;
+            let file = File::create(export_path)
+                .map_err(|e| format!("Failed to create export file: {e}"))?;
             let mut writer = BufWriter::new(file);
 
             // Fast-tests shortcut: emit deterministic minimal trajectory output matching real JSONL shape.
@@ -1575,11 +2065,43 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let budget_bytes = tt_mib.saturating_mul(1024 * 1024);
                 let cap = FixedTT::capacity_for_budget_bytes(budget_bytes);
                 let approx = FixedTT::approx_bytes_for_capacity(cap);
-                eprintln!("[worker 0] TT target={} MiB capacity={} entries ≈{:.1} MiB", tt_mib, cap, (approx as f64) / (1024.0 * 1024.0));
+                eprintln!(
+                    "[worker 0] TT target={} MiB capacity={} entries ≈{:.1} MiB",
+                    tt_mib,
+                    cap,
+                    (approx as f64) / (1024.0 * 1024.0)
+                );
+
+                let mut legal_mask = vec![0u8; 45];
+                for cell in 0..9usize {
+                    legal_mask[cell] = 1;
+                }
+                let best_move_stub = serde_json::json!({"action_id": 0, "card_id": 1, "cell": 0});
+                let policy_stub = match args.policy_format {
+                    PolicyFormatOpt::Onehot => best_move_stub.clone(),
+                    PolicyFormatOpt::Mcts => serde_json::json!({"1:0": 1.0}),
+                    PolicyFormatOpt::SoftExact => serde_json::json!({
+                        "format": "soft_exact",
+                        "action_space": "slot_cell_45",
+                        "temperature": args.soft_exact_temperature,
+                        "qmode": soft_exact_qmode_str(&args.soft_exact_qmode),
+                        "entries": [{"action_id": 0, "p": 1.0}],
+                    }),
+                };
 
                 for gid in 0..games {
                     for state_idx in 0u8..9u8 {
                         let line = serde_json::json!({
+                            "schema_version": 1,
+                            "generator": {
+                                "git_sha": &generator_meta.git_sha,
+                                "command_line": &generator_meta.command_line,
+                                "seed": generator_meta.seed,
+                                "ruleset": &generator_meta.ruleset,
+                                "export_mode": &generator_meta.export_mode,
+                                "policy_format": &generator_meta.policy_format,
+                                "value_mode": &generator_meta.value_mode,
+                            },
                             "game_id": gid,
                             "state_idx": state_idx,
                             "board": [
@@ -1593,23 +2115,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 {"cell":7,"card_id":null,"owner":null},
                                 {"cell":8,"card_id":null,"owner":null}
                             ],
-                            "hands": {"A": [], "B": []},
+                            "hands": {"A": [1], "B": []},
                             "to_move": "A",
                             "turn": state_idx,
                             "rules": {"elemental": false, "same": false, "plus": false, "same_wall": false},
-                            "policy_target": serde_json::Value::Null,
+                            "legal_moves_mask": &legal_mask,
+                            "policy_target": &policy_stub,
+                            "best_move": &best_move_stub,
+                            "action_taken": &best_move_stub,
+                            "best_action_id": 0,
                             "value_target": 0,
                             "value_mode": "winloss",
                             "off_pv": false,
                             "state_hash": format!("{:032x}", 0u128)
                         });
-                        let s = serde_json::to_string(&line).map_err(|e| format!("serialize fast_tests line error: {e}"))?;
-                        writer.write_all(s.as_bytes()).map_err(|e| format!("write sample export error: {e}"))?;
-                        writer.write_all(b"\n").map_err(|e| format!("write sample export error: {e}"))?;
+                        let s = serde_json::to_string(&line)
+                            .map_err(|e| format!("serialize fast_tests line error: {e}"))?;
+                        writer
+                            .write_all(s.as_bytes())
+                            .map_err(|e| format!("write sample export error: {e}"))?;
+                        writer
+                            .write_all(b"\n")
+                            .map_err(|e| format!("write sample export error: {e}"))?;
                     }
                 }
-                writer.flush().map_err(|e| format!("flush sample export error: {e}"))?;
-                println!("[export] fast_tests trajectory stub written ({} games)", games);
+                writer
+                    .flush()
+                    .map_err(|e| format!("flush sample export error: {e}"))?;
+                println!(
+                    "[export] fast_tests trajectory stub written ({} games)",
+                    games
+                );
                 return Ok(());
             }
 
@@ -1631,18 +2167,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let mut writer = writer;
                 let mut pending: BTreeMap<usize, Vec<String>> = BTreeMap::new();
                 let mut next_write: usize = 0;
- 
+
                 while let Ok((gid, lines)) = res_rx.recv() {
                     // Track incoming work size for progress rates
                     let batch_len: u64 = lines.len() as u64;
                     nodes_total_c.fetch_add(0, Ordering::Relaxed); // placeholder if needed
                     written_states_c.fetch_add(batch_len, Ordering::Relaxed);
- 
+
                     pending.insert(gid, lines);
                     // Flush contiguous games
                     while let Some(lines) = pending.remove(&next_write) {
                         for line in lines {
-                            writer.write_all(line.as_bytes()).expect("export write error");
+                            writer
+                                .write_all(line.as_bytes())
+                                .expect("export write error");
                             writer.write_all(b"\n").expect("export write error");
                         }
                         next_write = next_write.saturating_add(1);
@@ -1652,7 +2190,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // Drain (should be empty)
                 for (_gid, lines) in pending.into_iter() {
                     for line in lines {
-                        writer.write_all(line.as_bytes()).expect("export write error");
+                        writer
+                            .write_all(line.as_bytes())
+                            .expect("export write error");
                         writer.write_all(b"\n").expect("export write error");
                     }
                 }
@@ -1672,6 +2212,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let elements_opt = args.elements.clone();
                 let policy_format = args.policy_format.clone();
                 let mcts_rollouts = args.mcts_rollouts;
+                let soft_exact_temperature = args.soft_exact_temperature;
+                let soft_exact_qmode = args.soft_exact_qmode.clone();
+                let soft_exact_topk = args.soft_exact_topk;
+                let soft_exact_epsilon = args.soft_exact_epsilon;
                 let off_pv_rate = args.off_pv_rate;
                 let off_pv_strategy = args.off_pv_strategy.clone();
                 let value_mode = args.value_mode.clone();
@@ -1679,6 +2223,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let max_games = games;
                 let tt_mib = args.tt_bytes;
                 let chunk_size = effective_chunk_size;
+                let generator = generator_meta.clone();
 
                 // New: play strategy and heuristic/mix parameters
                 let play_strategy = args.play_strategy.clone();
@@ -1718,8 +2263,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let end = (start + chunk_size).min(max_games);
                         for i in start..end {
                             // Per-game deterministic RNG
-                            let mut rng_state: u64 = base_seed ^ ((i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
-    
+                            let mut rng_state: u64 =
+                                base_seed ^ ((i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+
                             // Sample hands deterministically
                             let (hand_a, hand_b) = match hand_strategy {
                                 HandStrategyOpt::Random => {
@@ -1735,7 +2281,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     (ha, hb)
                                 }
                             };
-    
+
                             // Elements per game
                             let cell_elements = match elements_opt {
                                 ElementsOpt::None => None,
@@ -1744,8 +2290,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     Some(gen_elements(seed_for_elems))
                                 }
                             };
-    
-                            let mut state = GameState::with_hands(rules, hand_a, hand_b, cell_elements);
+
+                            let mut state =
+                                GameState::with_hands(rules, hand_a, hand_b, cell_elements);
 
                             // New: per-game heuristic weights snapshot
                             let heur_weights = HeurWeights {
@@ -1756,31 +2303,42 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 defense: heur_w_defense,
                                 element: heur_w_element,
                             };
-    
+
                             // Per-game off-PV activation
-                            let off_pv_game = matches!(off_pv_strategy, OffPvStrategyOpt::Random | OffPvStrategyOpt::Weighted | OffPvStrategyOpt::Mcts)
-                                && off_pv_rate > 0.0
+                            let off_pv_game = matches!(
+                                off_pv_strategy,
+                                OffPvStrategyOpt::Random
+                                    | OffPvStrategyOpt::Weighted
+                                    | OffPvStrategyOpt::Mcts
+                            ) && off_pv_rate > 0.0
                                 && {
                                     let mut grng = rng_for_state(base_seed, i as u64, 0);
                                     grng.gen::<f32>() < off_pv_rate
                                 };
-    
+
                             let mut lines: Vec<String> = Vec::with_capacity(9);
-    
+
                             let mut nodes_sum_local: u64 = 0;
                             for _ply in 0..9 {
                                 let eff_depth = 9 - state.board.filled_count();
                                 // Always search full remaining depth (trajectory semantics)
-                                let (val, bm, child_vals, nodes) = search_root_with_children(&state, &cards_c, eff_depth, &mut tt);
+                                let (val, bm, child_vals, nodes) =
+                                    search_root_with_children(&state, &cards_c, eff_depth, &mut tt);
                                 nodes_sum_local = nodes_sum_local.saturating_add(nodes);
-    
+
                                 // Board vector
                                 let mut board_vec: Vec<BoardCell> = Vec::with_capacity(9);
                                 let elemental_enabled = state.rules.elemental;
                                 for cell in 0u8..9 {
                                     let slot = state.board.get(cell);
                                     let (card_id, owner) = match slot {
-                                        Some(s) => (Some(s.card_id), Some(match s.owner { Owner::A => 'A', Owner::B => 'B' })),
+                                        Some(s) => (
+                                            Some(s.card_id),
+                                            Some(match s.owner {
+                                                Owner::A => 'A',
+                                                Owner::B => 'B',
+                                            }),
+                                        ),
                                         None => (None, None),
                                     };
                                     let element_field: Option<Option<char>> = if elemental_enabled {
@@ -1788,61 +2346,87 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     } else {
                                         None
                                     };
-                                    board_vec.push(BoardCell { cell, card_id, owner, element: element_field });
+                                    board_vec.push(BoardCell {
+                                        cell,
+                                        card_id,
+                                        owner,
+                                        element: element_field,
+                                    });
                                 }
-    
+
                                 // Hands snapshot
                                 let mut hands_a_vec: Vec<u16> = Vec::with_capacity(5);
                                 let mut hands_b_vec: Vec<u16> = Vec::with_capacity(5);
-                                for &o in state.hands_a.iter() { if let Some(id) = o { hands_a_vec.push(id); } }
-                                for &o in state.hands_b.iter() { if let Some(id) = o { hands_b_vec.push(id); } }
-                                let hands_rec = HandsRecord { a: hands_a_vec, b: hands_b_vec };
-    
+                                for &o in state.hands_a.iter() {
+                                    if let Some(id) = o {
+                                        hands_a_vec.push(id);
+                                    }
+                                }
+                                for &o in state.hands_b.iter() {
+                                    if let Some(id) = o {
+                                        hands_b_vec.push(id);
+                                    }
+                                }
+                                let hands_rec = HandsRecord {
+                                    a: hands_a_vec,
+                                    b: hands_b_vec,
+                                };
+
                                 // Optional root MCTS distribution cache for off-PV re-use
                                 let mut mcts_root_dist: Option<BTreeMap<String, f32>> = None;
-    
+                                let mut best_action_id: Option<u8> = None;
+
                                 // Policy output
                                 let policy_out: Option<PolicyOut> = match policy_format {
-                                    PolicyFormatOpt::Onehot => {
-                                        bm.map(|m| PolicyOut::Move { card_id: m.card_id, cell: m.cell })
-                                    }
+                                    PolicyFormatOpt::Onehot => bm.map(|m| {
+                                        let out = action_move_out(&state, m).expect(
+                                            "action mapping must succeed for onehot best move",
+                                        );
+                                        best_action_id = Some(out.action_id);
+                                        PolicyOut::Move(out)
+                                    }),
                                     PolicyFormatOpt::Mcts => {
                                         let seed_for_rollouts = splitmix64(&mut rng_state);
-                                        let dist = mcts_policy_distribution(&state, &cards_c, mcts_rollouts, seed_for_rollouts);
+                                        let dist = mcts_policy_distribution(
+                                            &state,
+                                            &cards_c,
+                                            mcts_rollouts,
+                                            seed_for_rollouts,
+                                        );
                                         mcts_root_dist = Some(dist.clone());
                                         Some(PolicyOut::Dist(dist))
                                     }
+                                    PolicyFormatOpt::SoftExact => {
+                                        let (soft, best) = soft_exact_policy_from_children(
+                                            &state,
+                                            &child_vals,
+                                            soft_exact_temperature,
+                                            &soft_exact_qmode,
+                                            soft_exact_topk,
+                                            soft_exact_epsilon,
+                                        )
+                                        .expect("soft_exact policy construction must succeed");
+                                        best_action_id = best;
+                                        Some(PolicyOut::SoftExact(soft))
+                                    }
                                 };
-    
-                                let to_move = match state.next { Owner::A => 'A', Owner::B => 'B' };
+
+                                let to_move = match state.next {
+                                    Owner::A => 'A',
+                                    Owner::B => 'B',
+                                };
                                 let vt = compute_value_target(&value_mode, val, state.next);
-    
-                                let rec = ExportRecord {
-                                    game_id: i,
-                                    state_idx: state.board.filled_count(),
-                                    board: board_vec,
-                                    hands: hands_rec,
-                                    to_move,
-                                    turn: state.board.filled_count(),
-                                    rules: state.rules,
-                                    policy_target: policy_out,
-                                    value_target: vt,
-                                    value_mode: value_mode_str(&value_mode).to_string(),
-                                    off_pv: off_pv_game,
-                                    state_hash: format!("{:032x}", zobrist_key(&state)),
-                                };
-                                let line = serde_json::to_string(&rec).expect("serialize JSONL record");
-                                lines.push(line);
-    
+
                                 // Choose next move based on play strategy (mix overrides off-PV)
                                 let next_mv = match play_strategy {
                                     PlayStrategyOpt::Mix => {
                                         // Use MCTS distribution only when policy_format is Mcts
-                                        let dist_opt = if matches!(policy_format, PolicyFormatOpt::Mcts) {
-                                            mcts_root_dist.as_ref()
-                                        } else {
-                                            None
-                                        };
+                                        let dist_opt =
+                                            if matches!(policy_format, PolicyFormatOpt::Mcts) {
+                                                mcts_root_dist.as_ref()
+                                            } else {
+                                                None
+                                            };
                                         choose_next_move_mixed(
                                             &state,
                                             &cards_c,
@@ -1863,19 +2447,54 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         if off_pv_game {
                                             match off_pv_strategy {
                                                 OffPvStrategyOpt::Random => {
-                                                    pick_random_non_pv_move(&state, bm, base_seed, i as u64, state.board.filled_count())
+                                                    pick_random_non_pv_move(
+                                                        &state,
+                                                        bm,
+                                                        base_seed,
+                                                        i as u64,
+                                                        state.board.filled_count(),
+                                                    )
                                                 }
                                                 OffPvStrategyOpt::Weighted => {
-                                                    pick_weighted_non_pv_move(&child_vals, bm, base_seed, i as u64, state.board.filled_count())
+                                                    pick_weighted_non_pv_move(
+                                                        &child_vals,
+                                                        bm,
+                                                        base_seed,
+                                                        i as u64,
+                                                        state.board.filled_count(),
+                                                    )
                                                 }
                                                 OffPvStrategyOpt::Mcts => {
-                                                    if matches!(policy_format, PolicyFormatOpt::Mcts) {
-                                                        let dist_ref = mcts_root_dist.as_ref().expect("mcts_root_dist present");
-                                                        pick_mcts_non_pv_move_from_dist(dist_ref, bm, base_seed, i as u64, state.board.filled_count())
+                                                    if matches!(
+                                                        policy_format,
+                                                        PolicyFormatOpt::Mcts
+                                                    ) {
+                                                        let dist_ref = mcts_root_dist
+                                                            .as_ref()
+                                                            .expect("mcts_root_dist present");
+                                                        pick_mcts_non_pv_move_from_dist(
+                                                            dist_ref,
+                                                            bm,
+                                                            base_seed,
+                                                            i as u64,
+                                                            state.board.filled_count(),
+                                                        )
                                                     } else {
-                                                        let seed_for_mcts_step = splitmix64(&mut rng_state);
-                                                        let dist2 = mcts_policy_distribution(&state, &cards_c, mcts_rollouts, seed_for_mcts_step);
-                                                        pick_mcts_non_pv_move_from_dist(&dist2, bm, base_seed, i as u64, state.board.filled_count())
+                                                        let seed_for_mcts_step =
+                                                            splitmix64(&mut rng_state);
+                                                        let dist2 = mcts_policy_distribution(
+                                                            &state,
+                                                            &cards_c,
+                                                            mcts_rollouts,
+                                                            seed_for_mcts_step,
+                                                        );
+                                                        pick_mcts_non_pv_move_from_dist(
+                                                            &dist2,
+                                                            bm,
+                                                            base_seed,
+                                                            i as u64,
+                                                            state.board.filled_count(),
+                                                        )
                                                     }
                                                 }
                                             }
@@ -1886,7 +2505,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     PlayStrategyOpt::Mcts => {
                                         if matches!(policy_format, PolicyFormatOpt::Mcts) {
                                             match mcts_root_dist.as_ref() {
-                                                Some(dist) => choose_next_move_mcts(&state, dist, base_seed, i as u64, state.board.filled_count()),
+                                                Some(dist) => choose_next_move_mcts(
+                                                    &state,
+                                                    dist,
+                                                    base_seed,
+                                                    i as u64,
+                                                    state.board.filled_count(),
+                                                ),
                                                 None => bm,
                                             }
                                         } else {
@@ -1894,10 +2519,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             if off_pv_game {
                                                 match off_pv_strategy {
                                                     OffPvStrategyOpt::Random => {
-                                                        pick_random_non_pv_move(&state, bm, base_seed, i as u64, state.board.filled_count())
+                                                        pick_random_non_pv_move(
+                                                            &state,
+                                                            bm,
+                                                            base_seed,
+                                                            i as u64,
+                                                            state.board.filled_count(),
+                                                        )
                                                     }
                                                     OffPvStrategyOpt::Weighted => {
-                                                        pick_weighted_non_pv_move(&child_vals, bm, base_seed, i as u64, state.board.filled_count())
+                                                        pick_weighted_non_pv_move(
+                                                            &child_vals,
+                                                            bm,
+                                                            base_seed,
+                                                            i as u64,
+                                                            state.board.filled_count(),
+                                                        )
                                                     }
                                                     OffPvStrategyOpt::Mcts => bm,
                                                 }
@@ -1906,11 +2543,48 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                             }
                                         }
                                     }
-                                    PlayStrategyOpt::Heuristic => {
-                                        choose_next_move_heuristic(&state, &cards_c, &heur_weights, base_seed, i as u64, state.board.filled_count())
-                                    }
+                                    PlayStrategyOpt::Heuristic => choose_next_move_heuristic(
+                                        &state,
+                                        &cards_c,
+                                        &heur_weights,
+                                        base_seed,
+                                        i as u64,
+                                        state.board.filled_count(),
+                                    ),
                                 };
-    
+
+                                let best_move = bm.map(|m| {
+                                    action_move_out(&state, m)
+                                        .expect("action mapping must succeed for best_move")
+                                });
+                                let action_taken = next_mv.map(|m| {
+                                    action_move_out(&state, m)
+                                        .expect("action mapping must succeed for action_taken")
+                                });
+                                let rec = ExportRecord {
+                                    schema_version: 1,
+                                    generator: generator.clone(),
+                                    game_id: i,
+                                    state_idx: state.board.filled_count(),
+                                    board: board_vec,
+                                    hands: hands_rec,
+                                    to_move,
+                                    turn: state.board.filled_count(),
+                                    rules: state.rules,
+                                    legal_moves_mask: legal_moves_mask_45(&state),
+                                    best_move,
+                                    action_taken,
+                                    best_action_id,
+                                    policy_target: policy_out,
+                                    value_target: vt,
+                                    value_mode: value_mode_str(&value_mode).to_string(),
+                                    off_pv: off_pv_game,
+                                    state_hash: format!("{:032x}", zobrist_key(&state)),
+                                };
+                                let line =
+                                    serde_json::to_string(&rec).expect("serialize JSONL record");
+                                lines.push(line);
+
                                 if let Some(mv) = next_mv {
                                     if let Ok(ns) = apply_move(&state, &cards_c, mv) {
                                         state = ns;
@@ -1920,10 +2594,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 } else {
                                     break;
                                 }
-    
+
                                 // Throttled progress update message (in main would need shared state; skip here in worker)
                             } // ply loop
-    
+
                             let _ = nodes_total_c.fetch_add(nodes_sum_local, Ordering::Relaxed);
                             let _ = res_tx.send((i, lines));
                         } // for i in chunk
@@ -1986,7 +2660,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let initial = GameState::with_hands(rules, hand_a, hand_b, cell_elements);
 
             // Create output JSONL file for full export
-            let file = File::create(export_path).map_err(|e| format!("Failed to create export file: {e}"))?;
+            let file = File::create(export_path)
+                .map_err(|e| format!("Failed to create export file: {e}"))?;
             let mut writer = BufWriter::new(file);
 
             // Enumerate via DFS, computing labels with search_root
@@ -2022,14 +2697,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 export_cfg: &ExportConfig,
             ) {
                 let depth = eff_depth_for(state, cap);
-                let (val, bm, _nodes) = search_root(state, cards, depth, tt);
+                let (val, bm, child_vals, _nodes) =
+                    search_root_with_children(state, cards, depth, tt);
 
                 let mut board_vec: Vec<BoardCell> = Vec::with_capacity(9);
                 let elemental_enabled = state.rules.elemental;
                 for cell in 0u8..9 {
                     let slot = state.board.get(cell);
                     let (card_id, owner) = match slot {
-                        Some(s) => (Some(s.card_id), Some(match s.owner { Owner::A => 'A', Owner::B => 'B' })),
+                        Some(s) => (
+                            Some(s.card_id),
+                            Some(match s.owner {
+                                Owner::A => 'A',
+                                Owner::B => 'B',
+                            }),
+                        ),
                         None => (None, None),
                     };
                     let element_field: Option<Option<char>> = if elemental_enabled {
@@ -2037,29 +2719,71 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     } else {
                         None
                     };
-                    board_vec.push(BoardCell { cell, card_id, owner, element: element_field });
+                    board_vec.push(BoardCell {
+                        cell,
+                        card_id,
+                        owner,
+                        element: element_field,
+                    });
                 }
 
                 let mut ha: Vec<u16> = Vec::with_capacity(5);
                 let mut hb: Vec<u16> = Vec::with_capacity(5);
-                for &o in state.hands_a.iter() { if let Some(id) = o { ha.push(id); } }
-                for &o in state.hands_b.iter() { if let Some(id) = o { hb.push(id); } }
+                for &o in state.hands_a.iter() {
+                    if let Some(id) = o {
+                        ha.push(id);
+                    }
+                }
+                for &o in state.hands_b.iter() {
+                    if let Some(id) = o {
+                        hb.push(id);
+                    }
+                }
                 let hands = HandsRecord { a: ha, b: hb };
 
+                let mut best_action_id: Option<u8> = None;
                 let policy_out: Option<PolicyOut> = match export_cfg.policy_format {
-                    PolicyFormatOpt::Onehot => bm.map(|m| PolicyOut::Move { card_id: m.card_id, cell: m.cell }),
+                    PolicyFormatOpt::Onehot => bm.map(|m| {
+                        let out = action_move_out(state, m)
+                            .expect("action mapping must succeed for onehot best move");
+                        best_action_id = Some(out.action_id);
+                        PolicyOut::Move(out)
+                    }),
                     PolicyFormatOpt::Mcts => {
                         let z = zobrist_key(state);
                         let seed = export_cfg.base_seed ^ (z as u64) ^ ((z >> 64) as u64);
-                        let dist = mcts_policy_distribution(state, cards, export_cfg.mcts_rollouts, seed);
+                        let dist =
+                            mcts_policy_distribution(state, cards, export_cfg.mcts_rollouts, seed);
                         Some(PolicyOut::Dist(dist))
+                    }
+                    PolicyFormatOpt::SoftExact => {
+                        let (soft, best) = soft_exact_policy_from_children(
+                            state,
+                            &child_vals,
+                            export_cfg.soft_exact_temperature,
+                            &export_cfg.soft_exact_qmode,
+                            export_cfg.soft_exact_topk,
+                            export_cfg.soft_exact_epsilon,
+                        )
+                        .expect("soft_exact policy construction must succeed");
+                        best_action_id = best;
+                        Some(PolicyOut::SoftExact(soft))
                     }
                 };
 
-                let to_move = match state.next { Owner::A => 'A', Owner::B => 'B' };
+                let to_move = match state.next {
+                    Owner::A => 'A',
+                    Owner::B => 'B',
+                };
                 let vt = compute_value_target(&export_cfg.value_mode, val, state.next);
 
+                let best_move = bm.map(|m| {
+                    action_move_out(state, m).expect("action mapping must succeed for best_move")
+                });
+
                 let rec = ExportRecord {
+                    schema_version: 1,
+                    generator: export_cfg.generator.clone(),
                     game_id: 0,
                     state_idx: state.board.filled_count(),
                     board: board_vec,
@@ -2067,6 +2791,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     to_move,
                     turn: state.board.filled_count(),
                     rules: state.rules,
+                    legal_moves_mask: legal_moves_mask_45(state),
+                    best_move,
+                    action_taken: None,
+                    best_action_id,
                     policy_target: policy_out,
                     value_target: vt,
                     value_mode: value_mode_str(&export_cfg.value_mode).to_string(),
@@ -2105,19 +2833,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 policy_format: args.policy_format.clone(),
                 value_mode: args.value_mode.clone(),
                 mcts_rollouts: args.mcts_rollouts,
+                soft_exact_temperature: args.soft_exact_temperature,
+                soft_exact_qmode: args.soft_exact_qmode.clone(),
+                soft_exact_topk: args.soft_exact_topk,
+                soft_exact_epsilon: args.soft_exact_epsilon,
                 off_pv_rate: args.off_pv_rate,
                 off_pv_strategy: args.off_pv_strategy.clone(),
                 base_seed: args.seed,
+                generator: generator_meta.clone(),
             };
 
-            dfs(&initial, cards_ref, &mut tt, &mut visited, args.max_depth, &mut out, &export_cfg);
+            dfs(
+                &initial,
+                cards_ref,
+                &mut tt,
+                &mut visited,
+                args.max_depth,
+                &mut out,
+                &export_cfg,
+            );
 
             let mut total_lines = 0usize;
             for mut rec in out {
                 rec.game_id = 0;
-                let line = serde_json::to_string(&rec).map_err(|e| format!("serialize JSONL record error: {e}"))?;
-                writer.write_all(line.as_bytes()).map_err(|e| format!("export write error: {e}"))?;
-                writer.write_all(b"\n").map_err(|e| format!("export write error: {e}"))?;
+                let line = serde_json::to_string(&rec)
+                    .map_err(|e| format!("serialize JSONL record error: {e}"))?;
+                writer
+                    .write_all(line.as_bytes())
+                    .map_err(|e| format!("export write error: {e}"))?;
+                writer
+                    .write_all(b"\n")
+                    .map_err(|e| format!("export write error: {e}"))?;
                 total_lines += 1;
                 if total_lines % 10_000 == 0 {
                     let _ = writer.flush();
@@ -2147,12 +2893,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             fn parse_hand_list(s: &str) -> Result<[u16; 5], String> {
                 let mut out: [u16; 5] = [0; 5];
                 let mut seen: hashbrown::HashSet<u16> = hashbrown::HashSet::new();
-                let parts: Vec<&str> = s.split(',').map(|t| t.trim()).filter(|t| !t.is_empty()).collect();
+                let parts: Vec<&str> = s
+                    .split(',')
+                    .map(|t| t.trim())
+                    .filter(|t| !t.is_empty())
+                    .collect();
                 if parts.len() != 5 {
                     return Err(format!("expected exactly 5 card ids, got {}", parts.len()));
                 }
                 for (i, tok) in parts.iter().enumerate() {
-                    let id: u16 = tok.parse().map_err(|_| format!("invalid card id '{}'", tok))?;
+                    let id: u16 = tok
+                        .parse()
+                        .map_err(|_| format!("invalid card id '{}'", tok))?;
                     if !seen.insert(id) {
                         return Err(format!("duplicate card id {} in the same hand", id));
                     }
@@ -2165,14 +2917,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let mut seen_elem: hashbrown::HashSet<Element> = hashbrown::HashSet::new();
                 let parts: Vec<&str> = s.split(',').map(|t| t.trim()).collect();
                 if parts.len() != 9 {
-                    return Err(format!("--graph-elements must have exactly 9 comma-separated entries, got {}", parts.len()));
+                    return Err(format!(
+                        "--graph-elements must have exactly 9 comma-separated entries, got {}",
+                        parts.len()
+                    ));
                 }
                 for (i, tok) in parts.iter().enumerate() {
-                    let opt = if tok.eq_ignore_ascii_case("-") || tok.eq_ignore_ascii_case("none") || tok.eq_ignore_ascii_case("null") || tok.is_empty() {
+                    let opt = if tok.eq_ignore_ascii_case("-")
+                        || tok.eq_ignore_ascii_case("none")
+                        || tok.eq_ignore_ascii_case("null")
+                        || tok.is_empty()
+                    {
                         None
                     } else {
-                        let ch = tok.chars().next().ok_or_else(|| format!("invalid element token '{}'", tok))?;
-                        let el = elem_from_letter(ch).map_err(|e| format!("invalid element at position {}: {}", i, e))?;
+                        let ch = tok
+                            .chars()
+                            .next()
+                            .ok_or_else(|| format!("invalid element token '{}'", tok))?;
+                        let el = elem_from_letter(ch)
+                            .map_err(|e| format!("invalid element at position {}: {}", i, e))?;
                         if !seen_elem.insert(el) {
                             return Err(format!("duplicate element '{}' in --graph-elements", tok));
                         }
@@ -2186,12 +2949,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut rng_state: u64 = args.seed;
 
             // Decide hands + elements
-            let (hand_a, hand_b, cell_elements): ([u16; 5], [u16; 5], Option<[Option<Element>; 9]>) = if args.graph_input {
+            let (hand_a, hand_b, cell_elements): (
+                [u16; 5],
+                [u16; 5],
+                Option<[Option<Element>; 9]>,
+            ) = if args.graph_input {
                 // Require both hands
-                let ha_s = args.graph_hand_a.as_ref().ok_or_else(|| "--graph-input requires --graph-hand-a".to_string())
-                    .map_err(|e| format!("{}", e)).unwrap();
-                let hb_s = args.graph_hand_b.as_ref().ok_or_else(|| "--graph-input requires --graph-hand-b".to_string())
-                    .map_err(|e| format!("{}", e)).unwrap();
+                let ha_s = args
+                    .graph_hand_a
+                    .as_ref()
+                    .ok_or_else(|| "--graph-input requires --graph-hand-a".to_string())
+                    .map_err(|e| format!("{}", e))
+                    .unwrap();
+                let hb_s = args
+                    .graph_hand_b
+                    .as_ref()
+                    .ok_or_else(|| "--graph-input requires --graph-hand-b".to_string())
+                    .map_err(|e| format!("{}", e))
+                    .unwrap();
 
                 let ha = parse_hand_list(ha_s).map_err(|e| format!("--graph-hand-a error: {e}"))?;
                 let hb = parse_hand_list(hb_s).map_err(|e| format!("--graph-hand-b error: {e}"))?;
@@ -2205,7 +2980,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 // Optional per-cell elements, with uniqueness constraint
                 let elems = match &args.graph_elements {
-                    Some(es) => Some(parse_graph_elements_arg(es).map_err(|e| format!("--graph-elements error: {e}"))?),
+                    Some(es) => Some(
+                        parse_graph_elements_arg(es)
+                            .map_err(|e| format!("--graph-elements error: {e}"))?,
+                    ),
                     None => None,
                 };
 
@@ -2242,12 +3020,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let export_dir = export_path;
             // Verify directory or create it
             if export_dir.exists() {
-                let meta = std::fs::metadata(export_dir).map_err(|e| format!("stat export path error: {e}"))?;
+                let meta = std::fs::metadata(export_dir)
+                    .map_err(|e| format!("stat export path error: {e}"))?;
                 if !meta.is_dir() {
                     return Err(format!("--export path '{}' exists and is not a directory. Graph mode requires a directory.", export_dir.display()).into());
                 }
             } else {
-                std::fs::create_dir_all(export_dir).map_err(|e| format!("create export directory error: {e}"))?;
+                std::fs::create_dir_all(export_dir)
+                    .map_err(|e| format!("create export directory error: {e}"))?;
             }
 
             // Resolve compression settings
@@ -2256,7 +3036,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let zstd_threads: usize = match args.zstd_threads {
                 Some(v) => v.max(1),
                 None => {
-                    let n = std::thread::available_parallelism().map(|nz| nz.get()).unwrap_or(1);
+                    let n = std::thread::available_parallelism()
+                        .map(|nz| nz.get())
+                        .unwrap_or(1);
                     n.min(4).max(1)
                 }
             };
@@ -2264,10 +3046,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let index_enabled = args.zstd_index && zstd_enabled;
 
             // Build file paths
-            let nodes_name = if zstd_enabled { "nodes.jsonl.zst" } else { "nodes.jsonl" };
+            let nodes_name = if zstd_enabled {
+                "nodes.jsonl.zst"
+            } else {
+                "nodes.jsonl"
+            };
             let nodes_path = export_dir.join(nodes_name);
             // Open nodes file
-            let nodes_file = File::create(&nodes_path).map_err(|e| format!("create nodes file error: {e}"))?;
+            let nodes_file =
+                File::create(&nodes_path).map_err(|e| format!("create nodes file error: {e}"))?;
 
             let idx_path_opt = if index_enabled {
                 Some(export_dir.join("nodes.idx.jsonl"))
@@ -2275,7 +3062,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 None
             };
             let idx_file_opt = match idx_path_opt.as_ref() {
-                Some(p) => Some(File::create(p).map_err(|e| format!("create index file error: {e}"))?),
+                Some(p) => {
+                    Some(File::create(p).map_err(|e| format!("create index file error: {e}"))?)
+                }
                 None => None,
             };
 
@@ -2283,96 +3072,120 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let sync_final = matches!(args.sync_mode, SyncModeOpt::Final);
             let buf_cap = triplecargo::solver::graph_writer::BUF_WRITER_CAP_BYTES;
             let frame_bytes = args.zstd_frame_bytes;
-            
+
             // Track whether we created sharded node outputs and their names for manifest building
             let mut nodes_sharded: bool = false;
             let mut nodes_shard_names: Vec<String> = Vec::new();
-            
-            let mut sink_box: Box<dyn triplecargo::solver::GraphJsonlSink> = if zstd_enabled && args.shards > 1 {
-                // Create per-shard node files nodes_000.jsonl.zst ... nodes_{N-1}.jsonl.zst
-                let shards = args.shards;
-                let mut shard_files: Vec<File> = Vec::with_capacity(shards);
-                for i in 0..shards {
-                    let name = format!("nodes_{:03}.jsonl.zst", i);
-                    let path = export_dir.join(&name);
-                    let f = File::create(&path).map_err(|e| format!("create shard nodes file {} error: {e}", path.display()))?;
-                    shard_files.push(f);
-                    nodes_shard_names.push(name);
-                }
-                nodes_sharded = true;
-                // Shared index file (if enabled) is already prepared in idx_file_opt
-                Box::new(triplecargo::solver::AsyncShardedZstdFramesJsonlWriter::new(
-                    shard_files,
-                    idx_file_opt,
-                    buf_cap,            // BufWriter capacity (32 MiB)
-                    zstd_level,
-                    zstd_threads,
-                    frame_lines,
-                    frame_bytes,        // frame max bytes (soft cap)
-                    args.writer_queue_frames, // raw frames queue
-                    sync_final,
-                    zstd_enabled,
-                ))
-            } else if zstd_enabled {
-                // Single-file zstd writer (non-sharded)
-                Box::new(triplecargo::solver::AsyncZstdFramesJsonlWriter::new(
-                    nodes_file,
-                    idx_file_opt,
-                    buf_cap,            // BufWriter capacity (32 MiB)
-                    zstd_level,
-                    zstd_threads,
-                    frame_lines,
-                    frame_bytes,                       // frame max bytes (soft cap)
-                    args.writer_queue_frames,          // raw frames queue
-                    args.zstd_workers,                 // compression workers (0 = single-stage)
-                    args.writer_queue_compressed,      // compressed frames queue
-                    sync_final,
-                    zstd_enabled,
-                ))
-            } else {
-                Box::new(triplecargo::solver::PlainJsonlWriter::new(
-                    nodes_file,
-                    buf_cap,
-                    sync_final,
-                    zstd_enabled,
-                ))
-            };
 
-            // Run high-throughput export through sink
-            let t_start = Instant::now();
-            let outcome_res = triplecargo::solver::graph_precompute_export_with_sink(&initial, &cards, args.max_depth, &mut *sink_box);
-
-            // If zstd was requested but failed (e.g., codec unavailable), fall back to plain JSONL
-            let (outcome, stats, final_nodes_name, final_index_name, compression_enabled) = match outcome_res {
-                Ok(o) => {
-                    let stats = triplecargo::solver::GraphJsonlSink::finish_mut(&mut *sink_box)
-                        .map_err(|e| format!("finalize sink error: {e}"))?;
-                    let idx_name = if index_enabled && stats.index_sha256_hex.is_some() { Some("nodes.idx.jsonl".to_string()) } else { None };
-                    (o, stats, nodes_name.to_string(), idx_name, zstd_enabled)
-                }
-                Err(e) if zstd_enabled => {
-                    eprintln!("[graph] zstd writer failed: {e}. Falling back to uncompressed JSONL.");
-                    // Re-open plain writer and rerun
-                    let plain_nodes_name = "nodes.jsonl".to_string();
-                    let plain_nodes_path = export_dir.join(&plain_nodes_name);
-                    let plain_nodes_file = File::create(&plain_nodes_path).map_err(|e| format!("create plain nodes file error: {e}"))?;
-                    zstd_enabled = false;
-                    let mut plain_sink = triplecargo::solver::PlainJsonlWriter::new(
-                        plain_nodes_file,
+            let mut sink_box: Box<dyn triplecargo::solver::GraphJsonlSink> =
+                if zstd_enabled && args.shards > 1 {
+                    // Create per-shard node files nodes_000.jsonl.zst ... nodes_{N-1}.jsonl.zst
+                    let shards = args.shards;
+                    let mut shard_files: Vec<File> = Vec::with_capacity(shards);
+                    for i in 0..shards {
+                        let name = format!("nodes_{:03}.jsonl.zst", i);
+                        let path = export_dir.join(&name);
+                        let f = File::create(&path).map_err(|e| {
+                            format!("create shard nodes file {} error: {e}", path.display())
+                        })?;
+                        shard_files.push(f);
+                        nodes_shard_names.push(name);
+                    }
+                    nodes_sharded = true;
+                    // Shared index file (if enabled) is already prepared in idx_file_opt
+                    Box::new(triplecargo::solver::AsyncShardedZstdFramesJsonlWriter::new(
+                        shard_files,
+                        idx_file_opt,
+                        buf_cap, // BufWriter capacity (32 MiB)
+                        zstd_level,
+                        zstd_threads,
+                        frame_lines,
+                        frame_bytes,              // frame max bytes (soft cap)
+                        args.writer_queue_frames, // raw frames queue
+                        sync_final,
+                        zstd_enabled,
+                    ))
+                } else if zstd_enabled {
+                    // Single-file zstd writer (non-sharded)
+                    Box::new(triplecargo::solver::AsyncZstdFramesJsonlWriter::new(
+                        nodes_file,
+                        idx_file_opt,
+                        buf_cap, // BufWriter capacity (32 MiB)
+                        zstd_level,
+                        zstd_threads,
+                        frame_lines,
+                        frame_bytes,                  // frame max bytes (soft cap)
+                        args.writer_queue_frames,     // raw frames queue
+                        args.zstd_workers,            // compression workers (0 = single-stage)
+                        args.writer_queue_compressed, // compressed frames queue
+                        sync_final,
+                        zstd_enabled,
+                    ))
+                } else {
+                    Box::new(triplecargo::solver::PlainJsonlWriter::new(
+                        nodes_file,
                         buf_cap,
                         sync_final,
                         zstd_enabled,
-                    );
-                    let outcome2 = triplecargo::solver::graph_precompute_export_with_sink(&initial, &cards, args.max_depth, &mut plain_sink)
+                    ))
+                };
+
+            // Run high-throughput export through sink
+            let t_start = Instant::now();
+            let outcome_res = triplecargo::solver::graph_precompute_export_with_sink(
+                &initial,
+                &cards,
+                args.max_depth,
+                &mut *sink_box,
+            );
+
+            // If zstd was requested but failed (e.g., codec unavailable), fall back to plain JSONL
+            let (outcome, stats, final_nodes_name, final_index_name, compression_enabled) =
+                match outcome_res {
+                    Ok(o) => {
+                        let stats = triplecargo::solver::GraphJsonlSink::finish_mut(&mut *sink_box)
+                            .map_err(|e| format!("finalize sink error: {e}"))?;
+                        let idx_name = if index_enabled && stats.index_sha256_hex.is_some() {
+                            Some("nodes.idx.jsonl".to_string())
+                        } else {
+                            None
+                        };
+                        (o, stats, nodes_name.to_string(), idx_name, zstd_enabled)
+                    }
+                    Err(e) if zstd_enabled => {
+                        eprintln!(
+                            "[graph] zstd writer failed: {e}. Falling back to uncompressed JSONL."
+                        );
+                        // Re-open plain writer and rerun
+                        let plain_nodes_name = "nodes.jsonl".to_string();
+                        let plain_nodes_path = export_dir.join(&plain_nodes_name);
+                        let plain_nodes_file = File::create(&plain_nodes_path)
+                            .map_err(|e| format!("create plain nodes file error: {e}"))?;
+                        zstd_enabled = false;
+                        let mut plain_sink = triplecargo::solver::PlainJsonlWriter::new(
+                            plain_nodes_file,
+                            buf_cap,
+                            sync_final,
+                            zstd_enabled,
+                        );
+                        let outcome2 = triplecargo::solver::graph_precompute_export_with_sink(
+                            &initial,
+                            &cards,
+                            args.max_depth,
+                            &mut plain_sink,
+                        )
                         .map_err(|e| format!("graph export retry (plain) error: {e}"))?;
-                    let stats2 = triplecargo::solver::GraphJsonlSink::finish_mut(&mut plain_sink)
-                        .map_err(|e| format!("finalize plain sink error: {e}"))?;
-                    (outcome2, stats2, plain_nodes_name, None, false)
-                }
-                Err(e) => {
-                    return Err(Box::<dyn std::error::Error>::from(format!("graph precompute error: {e}")));
-                }
-            };
+                        let stats2 =
+                            triplecargo::solver::GraphJsonlSink::finish_mut(&mut plain_sink)
+                                .map_err(|e| format!("finalize plain sink error: {e}"))?;
+                        (outcome2, stats2, plain_nodes_name, None, false)
+                    }
+                    Err(e) => {
+                        return Err(Box::<dyn std::error::Error>::from(format!(
+                            "graph precompute error: {e}"
+                        )));
+                    }
+                };
 
             let elapsed = t_start.elapsed();
 
@@ -2416,7 +3229,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "manifest": manifest_name,
                 })
             };
-            
+
             // Integrity: when sharded, include per-shard node digests; otherwise single nodes digest
             let integrity_obj = if nodes_sharded {
                 serde_json::json!({
@@ -2446,9 +3259,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             // Write manifest
             {
-                let mut mf = File::create(&manifest_path).map_err(|e| format!("create manifest file error: {e}"))?;
-                let buf = serde_json::to_vec_pretty(&manifest).map_err(|e| format!("serialize manifest error: {e}"))?;
-                mf.write_all(&buf).map_err(|e| format!("write manifest error: {e}"))?;
+                let mut mf = File::create(&manifest_path)
+                    .map_err(|e| format!("create manifest file error: {e}"))?;
+                let buf = serde_json::to_vec_pretty(&manifest)
+                    .map_err(|e| format!("serialize manifest error: {e}"))?;
+                mf.write_all(&buf)
+                    .map_err(|e| format!("write manifest error: {e}"))?;
             }
 
             println!(

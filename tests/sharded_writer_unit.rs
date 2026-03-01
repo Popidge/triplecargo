@@ -43,7 +43,9 @@ fn sharded_writer_simple_smoke() {
     // Emit a small number of lines (10) so both shards get some frames
     for i in 0..10u8 {
         let line = format!(r#"{{"i":{}}}"#, i);
-        writer.write_line(line.as_bytes(), (i % 3) as u8).expect("write_line");
+        writer
+            .write_line(line.as_bytes(), (i % 3) as u8)
+            .expect("write_line");
     }
 
     let stats = writer.finish_mut().expect("finish");
@@ -51,7 +53,10 @@ fn sharded_writer_simple_smoke() {
     // Expect some frames and per-shard digests
     assert!(stats.frame_count > 0, "frame_count should be > 0");
     assert!(stats.total_lines >= 10, "total_lines should be >= 10");
-    assert!(stats.nodes_sha256_list.is_some(), "expected per-shard digests");
+    assert!(
+        stats.nodes_sha256_list.is_some(),
+        "expected per-shard digests"
+    );
 
     // Files exist and non-empty
     let s0 = fs::metadata(&shard0).expect("meta0").len();

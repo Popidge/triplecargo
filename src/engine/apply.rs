@@ -2,10 +2,10 @@ use std::collections::VecDeque;
 
 use crate::board::{Board, Slot};
 use crate::cards::{Card, CardsDb};
+use crate::hash::{z_token_board, z_token_hand, z_token_next};
 use crate::rules::Rules;
 use crate::state::{GameState, Move};
 use crate::types::{Element, Owner};
-use crate::hash::{z_token_board, z_token_hand, z_token_next};
 
 #[inline]
 fn clamp_side(v: i16) -> u8 {
@@ -72,11 +72,15 @@ fn apply_basic_from(
 
     for (i, opt_nidx) in neighs.iter().enumerate() {
         let Some(nidx) = opt_nidx else { continue };
-        let Some(mut nslot) = board.get(*nidx) else { continue };
+        let Some(mut nslot) = board.get(*nidx) else {
+            continue;
+        };
         if nslot.owner == origin_owner {
             continue;
         }
-        let Some(ncard) = cards.get(nslot.card_id) else { continue };
+        let Some(ncard) = cards.get(nslot.card_id) else {
+            continue;
+        };
         let n_sides = adjusted_sides_for_cell(ncard, *nidx, board, rules);
 
         let placed_side = o_sides[i];
@@ -221,11 +225,7 @@ fn apply_same_plus_if_any(
 /// Apply a move as a pure transform: returns a new GameState on success.
 /// Validates: cell empty, card present in current hand.
 /// Implements Elemental, Same, Same Wall, Plus, and Combo per spec.
-pub fn apply_move(
-    state: &GameState,
-    cards: &CardsDb,
-    mv: Move,
-) -> Result<GameState, String> {
+pub fn apply_move(state: &GameState, cards: &CardsDb, mv: Move) -> Result<GameState, String> {
     let mut ns = state.clone();
     make_move(&mut ns, cards, mv)?;
     Ok(ns)
@@ -285,7 +285,8 @@ pub fn make_move(state: &mut GameState, cards: &CardsDb, mv: Move) -> Result<Und
     state.zobrist ^= z_token_board(mv.cell, placed_owner, mv.card_id);
 
     // Initial flips (Same/Plus)
-    let mut flips: Vec<(u8, Owner)> = apply_same_plus_if_any(&mut state.board, cards, &state.rules, mv.cell);
+    let mut flips: Vec<(u8, Owner)> =
+        apply_same_plus_if_any(&mut state.board, cards, &state.rules, mv.cell);
     for (idx, old_owner) in &flips {
         let slot = state.board.get(*idx).expect("flipped slot present");
         let card_id = slot.card_id;

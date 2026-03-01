@@ -82,10 +82,26 @@ impl Board {
     #[inline]
     pub fn neighbors(&self, idx: u8) -> [Option<u8>; 4] {
         let (r, c) = crate::types::idx_to_rc(idx);
-        let up = if r > 0 { Some(rc_to_idx(r - 1, c).unwrap()) } else { None };
-        let right = if c < 2 { Some(rc_to_idx(r, c + 1).unwrap()) } else { None };
-        let down = if r < 2 { Some(rc_to_idx(r + 1, c).unwrap()) } else { None };
-        let left = if c > 0 { Some(rc_to_idx(r, c - 1).unwrap()) } else { None };
+        let up = if r > 0 {
+            Some(rc_to_idx(r - 1, c).unwrap())
+        } else {
+            None
+        };
+        let right = if c < 2 {
+            Some(rc_to_idx(r, c + 1).unwrap())
+        } else {
+            None
+        };
+        let down = if r < 2 {
+            Some(rc_to_idx(r + 1, c).unwrap())
+        } else {
+            None
+        };
+        let left = if c > 0 {
+            Some(rc_to_idx(r, c - 1).unwrap())
+        } else {
+            None
+        };
         [up, right, down, left]
     }
 

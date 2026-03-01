@@ -13,9 +13,9 @@ pub enum Bound {
 /// Transposition table entry storing value bounds, depth, and the best move for ordering/PV.
 #[derive(Debug, Clone, Copy)]
 pub struct TTEntry {
-    pub value: i8,            // value from side-to-move perspective
-    pub depth: u8,            // remaining search depth when stored
-    pub flag: Bound,          // Exact / Lower / Upper
+    pub value: i8,   // value from side-to-move perspective
+    pub depth: u8,   // remaining search depth when stored
+    pub flag: Bound, // Exact / Lower / Upper
     pub best_move: Option<Move>,
 }
 
@@ -46,7 +46,10 @@ pub struct InMemoryTT {
 impl InMemoryTT {
     #[inline]
     pub fn with_capacity(cap: usize) -> Self {
-        Self { map: HashMap::with_capacity(cap), stats: TTStats::default() }
+        Self {
+            map: HashMap::with_capacity(cap),
+            stats: TTStats::default(),
+        }
     }
 
     /// Iterate over all entries (key, value) without allocating, for export/merge.

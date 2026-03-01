@@ -1,7 +1,8 @@
 use std::path::Path;
 
 use triplecargo::{
-    apply_move, is_terminal, legal_moves, load_cards_from_json, score, GameState, Move, Owner, Rules,
+    apply_move, is_terminal, legal_moves, load_cards_from_json, score, GameState, Move, Owner,
+    Rules,
 };
 
 fn cards_db() -> triplecargo::CardsDb {

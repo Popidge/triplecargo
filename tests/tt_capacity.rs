@@ -14,7 +14,9 @@ fn parse_log_numbers(s: &str) -> Option<(usize, usize, f64)> {
 
     let cap_idx = s.find("capacity=")?;
     let after_cap = &s[cap_idx + "capacity=".len()..];
-    let cap_end = after_cap.find(|c: char| !c.is_ascii_digit()).unwrap_or(after_cap.len());
+    let cap_end = after_cap
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(after_cap.len());
     let capacity_str = &after_cap[..cap_end];
     let capacity: usize = capacity_str.parse().ok()?;
 
@@ -35,15 +37,24 @@ fn is_power_of_two(x: usize) -> bool {
 fn tt_capacity_respects_budget_trajectory_16_and_64() {
     // Trajectory mode with threads=1 so only one worker prints a line
     let base_args = [
-        "--export-mode", "trajectory",
-        "--games", "1",
-        "--seed", "42",
-        "--hand-strategy", "random",
-        "--rules", "none",
-        "--elements", "none",
-        "--policy-format", "onehot",
-        "--value-mode", "winloss",
-        "--threads", "1",
+        "--export-mode",
+        "trajectory",
+        "--games",
+        "1",
+        "--seed",
+        "42",
+        "--hand-strategy",
+        "random",
+        "--rules",
+        "none",
+        "--elements",
+        "none",
+        "--policy-format",
+        "onehot",
+        "--value-mode",
+        "winloss",
+        "--threads",
+        "1",
     ];
 
     // 16 MiB
@@ -56,8 +67,8 @@ fn tt_capacity_respects_budget_trajectory_16_and_64() {
     assert!(out16.status.success(), "precompute exit != 0 for 16 MiB");
 
     let stderr16 = String::from_utf8_lossy(&out16.stderr);
-    let (tgt16, cap16, approx16) = parse_log_numbers(&stderr16)
-        .expect("failed to parse TT log for 16 MiB");
+    let (tgt16, cap16, approx16) =
+        parse_log_numbers(&stderr16).expect("failed to parse TT log for 16 MiB");
     assert_eq!(tgt16, 16, "target MiB mismatch in log for 16");
     assert!(is_power_of_two(cap16), "capacity must be power-of-two");
     assert!(approx16 > 0.0, "approx MiB must be positive");
@@ -73,8 +84,8 @@ fn tt_capacity_respects_budget_trajectory_16_and_64() {
     assert!(out64.status.success(), "precompute exit != 0 for 64 MiB");
 
     let stderr64 = String::from_utf8_lossy(&out64.stderr);
-    let (tgt64, cap64, approx64) = parse_log_numbers(&stderr64)
-        .expect("failed to parse TT log for 64 MiB");
+    let (tgt64, cap64, approx64) =
+        parse_log_numbers(&stderr64).expect("failed to parse TT log for 64 MiB");
     assert_eq!(tgt64, 64, "target MiB mismatch in log for 64");
     assert!(is_power_of_two(cap64), "capacity must be power-of-two");
     assert!(approx64 > 0.0, "approx MiB must be positive");

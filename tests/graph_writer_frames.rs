@@ -25,8 +25,8 @@ fn zstd_writer_frame_bytes_cap_triggers_multiple_frames() {
         nodes,
         idx,
         buf_cap,
-        3,           // zstd level
-        1,           // zstd threads
+        3, // zstd level
+        1, // zstd threads
         frame_lines,
         frame_bytes, // frame max bytes (soft cap, uncompressed)
         false,       // sync_final
@@ -67,12 +67,12 @@ fn zstd_writer_large_frame_bytes_cap_aggregates_into_single_frame() {
         nodes,
         idx,
         buf_cap,
-        3,            // zstd level
-        1,            // zstd threads
+        3, // zstd level
+        1, // zstd threads
         frame_lines,
-        frame_bytes,  // large cap
-        false,        // sync_final
-        true,         // hashing enabled
+        frame_bytes, // large cap
+        false,       // sync_final
+        true,        // hashing enabled
     );
 
     // ~4 MiB uncompressed: 1024 lines of 4096 bytes (+ newline)
@@ -82,6 +82,9 @@ fn zstd_writer_large_frame_bytes_cap_aggregates_into_single_frame() {
     }
     let stats = w.finish_mut().expect("finish");
 
-    assert_eq!(stats.frame_count, 1, "expected a single frame under 128 MiB cap");
+    assert_eq!(
+        stats.frame_count, 1,
+        "expected a single frame under 128 MiB cap"
+    );
     assert!(stats.total_lines == 1024, "total_lines must match input");
 }

@@ -2,16 +2,10 @@ use std::fs;
 use std::fs::File;
 use tempfile::tempdir;
 
-use triplecargo::solver::{
-    AsyncZstdFramesJsonlWriter,
-    GraphJsonlSink,
-};
 use serde_json::Value;
+use triplecargo::solver::{AsyncZstdFramesJsonlWriter, GraphJsonlSink};
 
-fn write_n_json_lines(
-    sink: &mut dyn GraphJsonlSink,
-    n: usize,
-) {
+fn write_n_json_lines(sink: &mut dyn GraphJsonlSink, n: usize) {
     for i in 0..n {
         let line = format!("{{\"i\":{}}}", i);
         // turn field can be constant for these tests
@@ -37,15 +31,15 @@ fn async_ordering_preserved_with_workers_2_and_index_enabled() {
         nodes,
         idx,
         buf_cap,
-        3,                 // zstd level
-        1,                 // zstd threads per encoder
+        3, // zstd level
+        1, // zstd threads per encoder
         frame_lines,
         frame_bytes,
-        4,                 // raw frames queue
-        2,                 // zstd_workers (pool)
-        4,                 // compressed frames queue
-        false,             // sync_final
-        true,              // hashing enabled
+        4,     // raw frames queue
+        2,     // zstd_workers (pool)
+        4,     // compressed frames queue
+        false, // sync_final
+        true,  // hashing enabled
     );
 
     let n = 64usize;
@@ -63,7 +57,10 @@ fn async_ordering_preserved_with_workers_2_and_index_enabled() {
     for line in s.lines() {
         let v: Value = serde_json::from_str(line).expect("json idx line");
         let f = v.get("frame").and_then(|x| x.as_u64()).expect("frame");
-        let ls = v.get("line_start").and_then(|x| x.as_u64()).expect("line_start");
+        let ls = v
+            .get("line_start")
+            .and_then(|x| x.as_u64())
+            .expect("line_start");
         let lines = v.get("lines").and_then(|x| x.as_u64()).expect("lines");
         assert_eq!(f, expected_frame, "frame must be sequential");
         assert_eq!(ls, expected_line_start, "line_start must be sequential");
@@ -101,9 +98,9 @@ fn async_workers0_and_workers2_yield_identical_outputs_small_payload() {
             1,
             frame_lines,
             frame_bytes,
-            8,  // raw queue
-            0,  // workers=0 => single-stage
-            4,  // compressed queue unused
+            8, // raw queue
+            0, // workers=0 => single-stage
+            4, // compressed queue unused
             false,
             true, // hashing enabled
         );
@@ -124,7 +121,7 @@ fn async_workers0_and_workers2_yield_identical_outputs_small_payload() {
             frame_lines,
             frame_bytes,
             8,
-            2,  // workers=2
+            2, // workers=2
             4,
             false,
             true, // hashing enabled
@@ -158,13 +155,13 @@ fn async_no_deadlock_with_index_disabled() {
         buf_cap,
         3,
         1,
-        1,                  // frame_lines_target
-        1 * 1024 * 1024,    // frame cap
-        2,                  // raw frames queue
-        2,                  // workers
-        1,                  // compressed queue
+        1,               // frame_lines_target
+        1 * 1024 * 1024, // frame cap
+        2,               // raw frames queue
+        2,               // workers
+        1,               // compressed queue
         false,
-        true,               // hashing enabled
+        true, // hashing enabled
     );
     write_n_json_lines(&mut w, 128);
     let stats = w.finish_mut().expect("finish");

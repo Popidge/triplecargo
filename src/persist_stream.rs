@@ -5,7 +5,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-use crate::persist::{DbHeader, SolvedEntry, FORMAT_VERSION, save_db, load_db};
+use crate::persist::{load_db, save_db, DbHeader, SolvedEntry, FORMAT_VERSION};
 
 const STREAM_MAGIC: [u8; 8] = *b"TCDBSTRM";
 
@@ -122,8 +122,8 @@ impl StreamWriter {
             }
             StreamCompression::Zstd => {
                 // Fixed level for determinism; single-threaded by default
-                let compressed =
-                    zstd::encode_all(std::io::Cursor::new(&payload), 3).map_err(|e| format!("zstd encode error: {e}"))?;
+                let compressed = zstd::encode_all(std::io::Cursor::new(&payload), 3)
+                    .map_err(|e| format!("zstd encode error: {e}"))?;
                 (self.compression.tag(), compressed)
             }
         };
@@ -160,18 +160,26 @@ impl StreamWriter {
 
     pub fn flush_all(&mut self) -> Result<(), String> {
         self.flush_batch()?;
-        self.file.flush().map_err(|e| format!("file flush error: {e}"))?;
+        self.file
+            .flush()
+            .map_err(|e| format!("file flush error: {e}"))?;
         Ok(())
     }
 
     pub fn sync_all(&mut self) -> Result<(), String> {
         self.flush_batch()?;
-        self.file.sync_all().map_err(|e| format!("file sync_all error: {e}"))?;
+        self.file
+            .sync_all()
+            .map_err(|e| format!("file sync_all error: {e}"))?;
         Ok(())
     }
 }
 
-fn write_stream_header(file: &mut File, header: &DbHeader, compression: StreamCompression) -> Result<(), String> {
+fn write_stream_header(
+    file: &mut File,
+    header: &DbHeader,
+    compression: StreamCompression,
+) -> Result<(), String> {
     // Magic
     file.write_all(&STREAM_MAGIC)
         .map_err(|e| format!("write stream magic error: {e}"))?;
@@ -244,7 +252,9 @@ impl StreamReader {
         let header: DbHeader = bincode::deserialize(&hdr_bytes)
             .map_err(|e| format!("bincode header deserialize error: {e}"))?;
 
-        let data_offset = file.seek(SeekFrom::Current(0)).map_err(|e| format!("seek error: {e}"))?;
+        let data_offset = file
+            .seek(SeekFrom::Current(0))
+            .map_err(|e| format!("seek error: {e}"))?;
 
         Ok(Self {
             file,
@@ -324,10 +334,8 @@ impl StreamReader {
                 lz4_flex::block::decompress(&body, ulen)
                     .map_err(|e| format!("lz4 decompress error: {e}"))?
             }
-            StreamCompression::Zstd => {
-                zstd::decode_all(std::io::Cursor::new(&body))
-                    .map_err(|e| format!("zstd decode error: {e}"))?
-            }
+            StreamCompression::Zstd => zstd::decode_all(std::io::Cursor::new(&body))
+                .map_err(|e| format!("zstd decode error: {e}"))?,
         };
 
         if payload.len() != ulen {
@@ -346,8 +354,8 @@ impl StreamReader {
             return Err("crc mismatch on frame payload".into());
         }
 
-        let items: Vec<(u128, SolvedEntry)> =
-            bincode::deserialize(&payload).map_err(|e| format!("bincode payload deserialize error: {e}"))?;
+        let items: Vec<(u128, SolvedEntry)> = bincode::deserialize(&payload)
+            .map_err(|e| format!("bincode payload deserialize error: {e}"))?;
 
         self.next_seq_expected = self.next_seq_expected.saturating_add(1);
 
@@ -414,7 +422,9 @@ fn prefer_solved_new_over_old(new: &SolvedEntry, old: &SolvedEntry) -> bool {
 }
 
 /// Convenience: compact a stream file into a BTreeMap.
-pub fn compact_stream_to_map<P: AsRef<Path>>(path: P) -> Result<(DbHeader, BTreeMap<u128, SolvedEntry>), String> {
+pub fn compact_stream_to_map<P: AsRef<Path>>(
+    path: P,
+) -> Result<(DbHeader, BTreeMap<u128, SolvedEntry>), String> {
     let mut reader = StreamReader::open(&path)?;
     let header = reader.header.clone();
     let merged = reader.read_all_compacted()?;
@@ -422,21 +432,28 @@ pub fn compact_stream_to_map<P: AsRef<Path>>(path: P) -> Result<(DbHeader, BTree
 }
 
 /// Compact a stream file directly into a legacy DB file using persist::save_db.
-pub fn compact_stream_to_db_file<P1: AsRef<Path>, P2: AsRef<Path>>(stream_path: P1, out_path: P2) -> Result<(), String> {
+pub fn compact_stream_to_db_file<P1: AsRef<Path>, P2: AsRef<Path>>(
+    stream_path: P1,
+    out_path: P2,
+) -> Result<(), String> {
     let (header, merged) = compact_stream_to_map(stream_path)?;
     save_db(out_path, &header, &merged)
 }
 
 /// Compact a stream file together with a baseline legacy DB file into a new legacy DB file.
 /// Baseline entries are merged first; stream entries then override using deterministic preference.
-pub fn compact_stream_with_baseline_to_db_file<P1: AsRef<Path>, P2: AsRef<Path>, P3: AsRef<Path>>(
+pub fn compact_stream_with_baseline_to_db_file<
+    P1: AsRef<Path>,
+    P2: AsRef<Path>,
+    P3: AsRef<Path>,
+>(
     stream_path: P1,
     baseline_db_path: P2,
     out_path: P3,
 ) -> Result<(), String> {
     let (stream_header, stream_map) = compact_stream_to_map(&stream_path)?;
-    let (base_header, base_map) = load_db(&baseline_db_path)
-        .map_err(|e| format!("load baseline db error: {e}"))?;
+    let (base_header, base_map) =
+        load_db(&baseline_db_path).map_err(|e| format!("load baseline db error: {e}"))?;
 
     // Basic header compatibility checks for determinism
     if stream_header.version != base_header.version

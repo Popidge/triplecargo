@@ -1,4 +1,4 @@
-use super::tt::{TranspositionTable, TTEntry};
+use super::tt::{TTEntry, TranspositionTable};
 use std::mem::size_of;
 
 /// Fixed-size direct-mapped transposition table.
@@ -16,7 +16,10 @@ pub struct FixedTT {
 impl FixedTT {
     #[inline]
     pub fn with_capacity_pow2(cap_pow2: usize) -> Self {
-        assert!(cap_pow2.is_power_of_two(), "TT capacity must be a power of two");
+        assert!(
+            cap_pow2.is_power_of_two(),
+            "TT capacity must be a power of two"
+        );
         let keys = vec![0u128; cap_pow2];
         let entries = vec![
             TTEntry {

@@ -1,7 +1,7 @@
-use triplecargo::{GameState, Rules};
 use triplecargo::board::Slot;
-use triplecargo::types::Owner;
 use triplecargo::solver::graph::fast_hands_from_board;
+use triplecargo::types::Owner;
+use triplecargo::{GameState, Rules};
 
 #[test]
 fn fast_hands_basic() {
@@ -12,9 +12,27 @@ fn fast_hands_basic() {
     // Build a GameState with those hands and place three cards on the board:
     // cells 0,1,2 contain card_ids 1,4,9 (owners chosen arbitrarily to ensure owner independence)
     let mut s = GameState::with_hands(Rules::default(), initial_a, initial_b, None);
-    s.board.set(0, Some(Slot { owner: Owner::A, card_id: 1 }));
-    s.board.set(1, Some(Slot { owner: Owner::B, card_id: 4 }));
-    s.board.set(2, Some(Slot { owner: Owner::A, card_id: 9 }));
+    s.board.set(
+        0,
+        Some(Slot {
+            owner: Owner::A,
+            card_id: 1,
+        }),
+    );
+    s.board.set(
+        1,
+        Some(Slot {
+            owner: Owner::B,
+            card_id: 4,
+        }),
+    );
+    s.board.set(
+        2,
+        Some(Slot {
+            owner: Owner::A,
+            card_id: 9,
+        }),
+    );
 
     let (ha, hb) = fast_hands_from_board(&s.board, initial_a, initial_b);
 

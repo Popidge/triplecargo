@@ -2,8 +2,9 @@ use std::path::PathBuf;
 
 use clap::{Parser, ValueEnum};
 use triplecargo::{
-    load_cards_from_json, zobrist_key, Element, GameState, Rules,
+    load_cards_from_json,
     persist::{load_db, ElementsMode},
+    zobrist_key, Element, GameState, Rules,
 };
 
 #[derive(Debug, Clone, ValueEnum)]
@@ -69,7 +70,10 @@ fn parse_hands(tokens: &[String]) -> Result<([u16; 5], [u16; 5]), String> {
     for t in tokens {
         let parts: Vec<&str> = t.split('=').collect();
         if parts.len() != 2 {
-            return Err(format!("Invalid hands token '{}', expected A=... or B=...", t));
+            return Err(format!(
+                "Invalid hands token '{}', expected A=... or B=...",
+                t
+            ));
         }
         let side = parts[0].trim();
         let vals = parts[1].trim();
@@ -82,7 +86,11 @@ fn parse_hands(tokens: &[String]) -> Result<([u16; 5], [u16; 5]), String> {
                 .map_err(|e| format!("Invalid card id in '{}': {e}", t))?
         };
         if ids.len() != 5 {
-            return Err(format!("Expected 5 card ids for {}, got {}", side, ids.len()));
+            return Err(format!(
+                "Expected 5 card ids for {}, got {}",
+                side,
+                ids.len()
+            ));
         }
         let arr = [ids[0], ids[1], ids[2], ids[3], ids[4]];
         match side {
@@ -135,8 +143,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
     // Load DB
-    let (header, map) = load_db(&args.db)
-        .map_err(|e| format!("DB load error: {e}"))?;
+    let (header, map) = load_db(&args.db).map_err(|e| format!("DB load error: {e}"))?;
 
     // Optionally, load cards just for validation or future use
     if let Err(e) = load_cards_from_json(&args.cards) {
@@ -145,8 +152,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Build a state using provided flags (must match the one used during precompute)
     let rules = parse_rules(&args.rules);
-    let (hand_a, hand_b) = parse_hands(&args.hands)
-        .map_err(|e| format!("Hands parse error: {e}"))?;
+    let (hand_a, hand_b) =
+        parse_hands(&args.hands).map_err(|e| format!("Hands parse error: {e}"))?;
     let elements_mode = match args.elements {
         ElementsOpt::None => ElementsMode::None,
         ElementsOpt::Random => ElementsMode::Random,

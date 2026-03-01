@@ -2,7 +2,7 @@ use std::path::Path;
 
 use triplecargo::{
     load_cards_from_json,
-    solver::{search_root, reconstruct_pv, InMemoryTT},
+    solver::{reconstruct_pv, search_root, InMemoryTT},
     GameState, Move, Rules,
 };
 
@@ -46,7 +46,10 @@ fn tt_array_and_hashmap_agree_on_values_and_pv_len() {
     let pv_fx = reconstruct_pv(&s, &cards, &tt_fx, remaining as usize);
 
     // Primary requirement: values agree
-    assert_eq!(val_fx, val_hm, "TT value mismatch between array and hashmap");
+    assert_eq!(
+        val_fx, val_hm,
+        "TT value mismatch between array and hashmap"
+    );
 
     // PV length sanity matches bounds (not necessarily identical sequence)
     assert!(

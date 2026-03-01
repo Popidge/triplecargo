@@ -1,8 +1,8 @@
 use assert_cmd::prelude::*;
 use predicates::prelude::*;
 use std::fs;
-use tempfile::tempdir;
 use std::path::Path;
+use tempfile::tempdir;
 
 #[test]
 fn shards_two_creates_shards_and_index() {
@@ -37,18 +37,34 @@ fn shards_two_creates_shards_and_index() {
     assert!(n0.exists(), "expected shard file {}", n0.display());
     assert!(n1.exists(), "expected shard file {}", n1.display());
     assert!(idx.exists(), "expected shared index {}", idx.display());
-    assert!(manifest.exists(), "expected manifest {}", manifest.display());
+    assert!(
+        manifest.exists(),
+        "expected manifest {}",
+        manifest.display()
+    );
 
     // Index lines should include "shard" field in at least one line
     let idx_bytes = fs::read(&idx).expect("read index");
     let idx_s = String::from_utf8_lossy(&idx_bytes);
-    assert!(idx_s.contains("\"shard\""), "index should include shard field: {}", idx_s);
+    assert!(
+        idx_s.contains("\"shard\""),
+        "index should include shard field: {}",
+        idx_s
+    );
 
     // Manifest should list nodes as array and include nodes_sha256_list when present
     let mf = fs::read_to_string(&manifest).expect("read manifest");
-    assert!(mf.contains("\"nodes\": ["), "manifest nodes should be an array: {}", mf);
+    assert!(
+        mf.contains("\"nodes\": ["),
+        "manifest nodes should be an array: {}",
+        mf
+    );
     // Integrity per-shard key
-    assert!(mf.contains("nodes_sha256") || mf.contains("nodes_sha256_list"), "expected nodes integrity in manifest: {}", mf);
+    assert!(
+        mf.contains("nodes_sha256") || mf.contains("nodes_sha256_list"),
+        "expected nodes integrity in manifest: {}",
+        mf
+    );
 
     // Quick sanity: shard files are non-empty (relaxed under fast_tests)
     if cfg!(feature = "fast_tests") {

@@ -53,11 +53,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Script a few moves deterministically for demo purposes
     let script = [
-        Move { card_id: 1, cell: 0 },  // A
-        Move { card_id: 6, cell: 1 },  // B
-        Move { card_id: 2, cell: 4 },  // A
-        Move { card_id: 7, cell: 3 },  // B
-        Move { card_id: 3, cell: 8 },  // A
+        Move {
+            card_id: 1,
+            cell: 0,
+        }, // A
+        Move {
+            card_id: 6,
+            cell: 1,
+        }, // B
+        Move {
+            card_id: 2,
+            cell: 4,
+        }, // A
+        Move {
+            card_id: 7,
+            cell: 3,
+        }, // B
+        Move {
+            card_id: 3,
+            cell: 8,
+        }, // A
     ];
 
     for (turn, mv) in script.into_iter().enumerate() {
@@ -65,7 +80,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             triplecargo::Owner::A => "A",
             triplecargo::Owner::B => "B",
         };
-        println!("Turn {}: {} plays card {} at cell {}", turn + 1, who, mv.card_id, mv.cell);
+        println!(
+            "Turn {}: {} plays card {} at cell {}",
+            turn + 1,
+            who,
+            mv.card_id,
+            mv.cell
+        );
         state = apply_move(&state, &cards, mv).map_err(|e| format!("apply_move failed: {e}"))?;
         print_board(&state);
         println!("Score (A - B) = {}", score(&state));
@@ -87,7 +108,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             res.depth, res.nodes, res.value
         );
         if let Some(bm) = res.best_move {
-            println!("[solver] best_move: card {} at cell {}", bm.card_id, bm.cell);
+            println!(
+                "[solver] best_move: card {} at cell {}",
+                bm.card_id, bm.cell
+            );
         } else {
             println!("[solver] no legal moves (terminal).");
         }

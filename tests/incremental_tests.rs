@@ -2,9 +2,8 @@ use std::path::Path;
 
 use triplecargo::{
     engine::apply::{make_move, unmake_move},
-    hash::{recompute_zobrist},
-    load_cards_from_json,
-    GameState, Move, Rules,
+    hash::recompute_zobrist,
+    load_cards_from_json, GameState, Move, Rules,
 };
 
 fn cards_db() -> triplecargo::CardsDb {
@@ -30,12 +29,20 @@ fn incremental_zobrist_matches_recompute_on_make_unmake() {
         // After make_move, cached key equals recompute
         let undo = make_move(&mut s2, &cards, mv).expect("make_move");
         let full_after = recompute_zobrist(&s2);
-        assert_eq!(s2.zobrist, full_after, "incremental != recompute after make_move: mv={:?}", (mv.card_id, mv.cell));
+        assert_eq!(
+            s2.zobrist,
+            full_after,
+            "incremental != recompute after make_move: mv={:?}",
+            (mv.card_id, mv.cell)
+        );
 
         // Unmake restores bit-for-bit (including zobrist)
         unmake_move(&mut s2, undo);
         assert_eq!(s2, state, "state not restored exactly after unmake");
-        assert_eq!(s2.zobrist, state.zobrist, "zobrist not restored after unmake");
+        assert_eq!(
+            s2.zobrist, state.zobrist,
+            "zobrist not restored after unmake"
+        );
     }
 }
 
@@ -51,17 +58,28 @@ fn make_unmake_longer_sequence_restores_exact_state() {
     // Play a short deterministic sequence using first legal move each ply
     let mut undos = Vec::new();
     for _ply in 0..4 {
-        let mv = triplecargo::legal_moves(&s).into_iter().next().expect("legal move");
+        let mv = triplecargo::legal_moves(&s)
+            .into_iter()
+            .next()
+            .expect("legal move");
         let u = make_move(&mut s, &cards, mv).expect("make_move");
         undos.push(u);
         // Invariant: cached z == recompute
-        assert_eq!(s.zobrist, recompute_zobrist(&s), "cached != recompute during sequence");
+        assert_eq!(
+            s.zobrist,
+            recompute_zobrist(&s),
+            "cached != recompute during sequence"
+        );
     }
 
     // Unmake in reverse
     while let Some(u) = undos.pop() {
         unmake_move(&mut s, u);
-        assert_eq!(s.zobrist, recompute_zobrist(&s), "after unmake cached != recompute");
+        assert_eq!(
+            s.zobrist,
+            recompute_zobrist(&s),
+            "after unmake cached != recompute"
+        );
     }
 
     // Exact restoration

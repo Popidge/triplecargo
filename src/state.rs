@@ -1,8 +1,8 @@
 use crate::board::Board;
+use crate::hash::recompute_zobrist;
 use crate::rules::Rules;
 use crate::types::{Element, Owner};
 use serde::{Deserialize, Serialize};
-use crate::hash::recompute_zobrist;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Move {

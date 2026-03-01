@@ -5,16 +5,21 @@ use crate::hash::zobrist_key;
 use crate::state::{is_terminal, legal_moves, GameState, Move};
 use crate::types::Owner;
 
-use super::SearchLimits;
-use super::tt::{Bound, TranspositionTable, TTEntry};
 use super::move_order::order_moves;
+use super::tt::{Bound, TTEntry, TranspositionTable};
+use super::SearchLimits;
 
 const ALPHA_INIT: i8 = -127;
 const BETA_INIT: i8 = 127;
 
 /// Negamax driver retained for backward compatibility.
 /// Values are from side-to-move perspective.
-pub fn negamax(state: &GameState, cards: &CardsDb, _limits: SearchLimits, tt: &mut dyn TranspositionTable) -> i8 {
+pub fn negamax(
+    state: &GameState,
+    cards: &CardsDb,
+    _limits: SearchLimits,
+    tt: &mut dyn TranspositionTable,
+) -> i8 {
     let depth = 9 - state.board.filled_count();
     let (val, _bm, _nodes) = search_root(state, cards, depth, tt);
     val
@@ -22,10 +27,15 @@ pub fn negamax(state: &GameState, cards: &CardsDb, _limits: SearchLimits, tt: &m
 
 /// Root search that performs full-depth negamax with alpha-beta and TT.
 /// Returns (value, best_move, nodes).
-pub fn search_root(state: &GameState, cards: &CardsDb, depth: u8, tt: &mut dyn TranspositionTable) -> (i8, Option<Move>, u64) {
+pub fn search_root(
+    state: &GameState,
+    cards: &CardsDb,
+    depth: u8,
+    tt: &mut dyn TranspositionTable,
+) -> (i8, Option<Move>, u64) {
     let mut nodes: u64 = 0;
     let mut scratch = state.clone();
- 
+
     // Terminal shortcut
     if is_terminal(&scratch) {
         let val = terminal_value(&scratch);
@@ -40,7 +50,7 @@ pub fn search_root(state: &GameState, cards: &CardsDb, depth: u8, tt: &mut dyn T
         );
         return (val, None, nodes);
     }
- 
+
     let key = zobrist_key(&scratch);
     let mut tt_best: Option<Move> = None;
     if let Some(entry) = tt.get(key) {
@@ -52,19 +62,27 @@ pub fn search_root(state: &GameState, cards: &CardsDb, depth: u8, tt: &mut dyn T
         }
         tt_best = entry.best_move;
     }
- 
+
     let mut moves = legal_moves(&scratch);
     order_moves(&mut moves, tt_best);
- 
+
     let mut alpha = ALPHA_INIT;
     let beta = BETA_INIT;
- 
+
     let mut best_val = ALPHA_INIT;
     let mut best_move: Option<Move> = None;
- 
+
     for mv in moves {
         if let Ok(undo) = make_move(&mut scratch, cards, mv) {
-            let val = -negamax_inner(&mut scratch, depth.saturating_sub(1), -beta, -alpha, tt, cards, &mut nodes);
+            let val = -negamax_inner(
+                &mut scratch,
+                depth.saturating_sub(1),
+                -beta,
+                -alpha,
+                tt,
+                cards,
+                &mut nodes,
+            );
             unmake_move(&mut scratch, undo);
             if val > best_val {
                 best_val = val;
@@ -78,7 +96,7 @@ pub fn search_root(state: &GameState, cards: &CardsDb, depth: u8, tt: &mut dyn T
             }
         }
     }
- 
+
     // Store root as Exact with chosen best move
     tt.put(
         key,
@@ -89,7 +107,7 @@ pub fn search_root(state: &GameState, cards: &CardsDb, depth: u8, tt: &mut dyn T
             best_move,
         },
     );
- 
+
     (best_val, best_move, nodes)
 }
 /// Root search that also returns per-child Q values for all legal moves at the root.
@@ -179,7 +197,7 @@ fn negamax_inner(
     nodes: &mut u64,
 ) -> i8 {
     *nodes += 1;
- 
+
     // Terminal or depth limit
     if is_terminal(state) {
         let val = terminal_value(state);
@@ -197,10 +215,10 @@ fn negamax_inner(
     if depth == 0 {
         return terminal_value(state);
     }
- 
+
     let key = zobrist_key(state);
     let mut tt_best: Option<Move> = None;
- 
+
     // TT probe
     if let Some(entry) = tt.get(key) {
         if entry.depth >= depth {
@@ -223,15 +241,15 @@ fn negamax_inner(
         }
         tt_best = entry.best_move;
     }
- 
+
     // Generate and order moves
     let mut moves = legal_moves(state);
     order_moves(&mut moves, tt_best);
- 
+
     let alpha_orig = alpha;
     let mut best_val = ALPHA_INIT;
     let mut best_mv: Option<Move> = None;
- 
+
     for mv in moves {
         if let Ok(undo) = make_move(state, cards, mv) {
             let val = -negamax_inner(state, depth - 1, -beta, -alpha, tt, cards, nodes);
@@ -248,7 +266,7 @@ fn negamax_inner(
             }
         }
     }
- 
+
     // Determine bound type for storage
     let flag = if best_val <= alpha_orig {
         Bound::Upper
@@ -257,7 +275,7 @@ fn negamax_inner(
     } else {
         Bound::Exact
     };
- 
+
     tt.put(
         key,
         TTEntry {
@@ -267,7 +285,7 @@ fn negamax_inner(
             best_move: best_mv,
         },
     );
- 
+
     best_val
 }
 
@@ -281,14 +299,25 @@ fn terminal_value(state: &GameState) -> i8 {
 }
 
 /// Principal variation reconstruction by following TT best_move entries deterministically.
-pub fn reconstruct_pv(state: &GameState, cards: &CardsDb, tt: &dyn TranspositionTable, max_len: usize) -> Vec<Move> {
+pub fn reconstruct_pv(
+    state: &GameState,
+    cards: &CardsDb,
+    tt: &dyn TranspositionTable,
+    max_len: usize,
+) -> Vec<Move> {
     let mut pv: Vec<Move> = Vec::new();
     let mut cur = state.clone();
     for _ in 0..max_len {
         let key = zobrist_key(&cur);
-        let Some(entry) = tt.get(key) else { break; };
-        let Some(mv) = entry.best_move else { break; };
-        let Ok(ns) = apply_move(&cur, cards, mv) else { break; };
+        let Some(entry) = tt.get(key) else {
+            break;
+        };
+        let Some(mv) = entry.best_move else {
+            break;
+        };
+        let Ok(ns) = apply_move(&cur, cards, mv) else {
+            break;
+        };
         pv.push(mv);
         cur = ns;
         if is_terminal(&cur) {

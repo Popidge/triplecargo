@@ -40,10 +40,24 @@ fn apply_move_basic_no_flip_on_tie() {
     // From data: card 35 Vysage has left=5 so not equal; card 28 Ochu left=3; find left=4:
     // Many cards have left=4; for determinism we pick id 29 SAM08G (left=4).
     // Set B's card at cell 5 (r=1,c=2)
-    state.board.set(5, Some(triplecargo::board::Slot { owner: Owner::B, card_id: 29 }));
+    state.board.set(
+        5,
+        Some(triplecargo::board::Slot {
+            owner: Owner::B,
+            card_id: 29,
+        }),
+    );
 
     // Now A plays Geezard (id=1) at center cell 4 (r=1,c=1). Right=4 vs neighbor left=4 => tie -> no flip.
-    let ns = apply_move(&state, &cards, Move { card_id: 1, cell: 4 }).expect("apply_move");
+    let ns = apply_move(
+        &state,
+        &cards,
+        Move {
+            card_id: 1,
+            cell: 4,
+        },
+    )
+    .expect("apply_move");
     // Neighbor should remain B
     let neigh = ns.board.get(5).expect("neighbor present");
     assert_eq!(neigh.owner, Owner::B);
@@ -59,10 +73,24 @@ fn apply_move_basic_flip_strictly_greater() {
     let mut state = GameState::with_hands(rules, [1, 2, 3, 4, 5], [6, 7, 8, 9, 10], None);
 
     // Opponent neighbor with left=1: id 7 Gesper has left=1
-    state.board.set(5, Some(triplecargo::board::Slot { owner: Owner::B, card_id: 7 }));
+    state.board.set(
+        5,
+        Some(triplecargo::board::Slot {
+            owner: Owner::B,
+            card_id: 7,
+        }),
+    );
 
     // A plays Geezard id=1 at center (cell 4), right=4 vs left=1 -> should flip neighbor at cell 5.
-    let ns = apply_move(&state, &cards, Move { card_id: 1, cell: 4 }).expect("apply_move");
+    let ns = apply_move(
+        &state,
+        &cards,
+        Move {
+            card_id: 1,
+            cell: 4,
+        },
+    )
+    .expect("apply_move");
     let neigh = ns.board.get(5).expect("neighbor present");
     assert_eq!(neigh.owner, Owner::A);
 }
@@ -79,13 +107,28 @@ fn elemental_adjustment_causes_flip() {
     // Center cell (4) has Earth element
     elements[4] = Some(triplecargo::Element::Earth);
 
-    let mut state = GameState::with_hands(rules, [87, 2, 3, 4, 5], [1, 7, 8, 9, 10], Some(elements));
+    let mut state =
+        GameState::with_hands(rules, [87, 2, 3, 4, 5], [1, 7, 8, 9, 10], Some(elements));
     // Pre-place opponent at (0,1)=cell 1
-    state.board.set(1, Some(triplecargo::board::Slot { owner: Owner::B, card_id: 1 }));
+    state.board.set(
+        1,
+        Some(triplecargo::board::Slot {
+            owner: Owner::B,
+            card_id: 1,
+        }),
+    );
 
     // Sacred id=87 has element Earth and top=5. On Earth cell, sides +1 => top becomes 6.
     // Compare placed top (6) vs neighbor bottom (5) -> flip.
-    let ns = apply_move(&state, &cards, Move { card_id: 87, cell: 4 }).expect("apply_move");
+    let ns = apply_move(
+        &state,
+        &cards,
+        Move {
+            card_id: 87,
+            cell: 4,
+        },
+    )
+    .expect("apply_move");
     let neigh = ns.board.get(1).expect("neighbor present");
     assert_eq!(neigh.owner, Owner::A);
 }

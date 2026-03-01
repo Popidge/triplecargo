@@ -87,31 +87,32 @@ fn validate_card(card: &Card) -> Result<(), String> {
 
 /// Load cards from a JSON file (runtime), building a dense id index and name lookup.
 pub fn load_cards_from_json<P: AsRef<Path>>(path: P) -> Result<CardsDb, String> {
-    let data = fs::read_to_string(path.as_ref()).map_err(|e| format!("Failed to read JSON: {e}"))?;
+    let data =
+        fs::read_to_string(path.as_ref()).map_err(|e| format!("Failed to read JSON: {e}"))?;
     let raw: Vec<Card> =
         serde_json::from_str(&data).map_err(|e| format!("Failed to parse JSON: {e}"))?;
- 
+
     if raw.is_empty() {
         return Err("No cards in JSON".to_string());
     }
- 
+
     // Cache the JSON entry count before we consume `raw` below.
     let raw_count = raw.len();
- 
+
     // Validate and compute max id
     let mut max_id: u16 = 0;
     for c in &raw {
         validate_card(c)?;
         max_id = max_id.max(c.id);
     }
- 
+
     let mut by_id: Vec<Option<Card>> = vec![None; (max_id as usize) + 1];
     let mut name_to_id: HashMap<String, u16> = HashMap::with_capacity(raw_count);
- 
+
     for c in raw {
         let id = c.id;
         let name = c.name.clone();
- 
+
         // uniqueness checks
         if let Some(existing) = by_id.get(id as usize).and_then(|x| x.as_ref()) {
             return Err(format!(
@@ -127,9 +128,9 @@ pub fn load_cards_from_json<P: AsRef<Path>>(path: P) -> Result<CardsDb, String> 
         }
         by_id[id as usize] = Some(c);
     }
- 
+
     let count = by_id.iter().filter(|c| c.is_some()).count();
- 
+
     // Sanity checks specific to the project's canonical data:
     // - Expect ids to be contiguous starting at 1 up to max_id with no gaps.
     // - Expect the number of cards in the dense index to match the JSON count.
@@ -147,22 +148,21 @@ pub fn load_cards_from_json<P: AsRef<Path>>(path: P) -> Result<CardsDb, String> 
         }
     }
     let min_present = min_present.unwrap_or(0);
- 
+
     if min_present != 1 {
         return Err(format!(
             "Unexpected minimum card id {} (expected 1). Check data/cards.json ids.",
             min_present
         ));
     }
- 
+
     if count != raw_count {
         return Err(format!(
             "Card count mismatch: JSON had {} entries but indexed {} present",
-            raw_count,
-            count
+            raw_count, count
         ));
     }
- 
+
     if (max_id as usize) != raw_count {
         // collect a short sample of missing ids in the 1..=max_id range
         let mut missing: Vec<u16> = Vec::new();
@@ -182,7 +182,7 @@ pub fn load_cards_from_json<P: AsRef<Path>>(path: P) -> Result<CardsDb, String> 
             ));
         }
     }
- 
+
     Ok(CardsDb {
         by_id,
         name_to_id,

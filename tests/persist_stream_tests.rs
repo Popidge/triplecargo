@@ -4,7 +4,9 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 
 use triplecargo::persist::{load_db, DbHeader, ElementsMode, SolvedEntry};
-use triplecargo::persist_stream::{compact_stream_to_db_file, StreamCompression, StreamReader, StreamWriter};
+use triplecargo::persist_stream::{
+    compact_stream_to_db_file, StreamCompression, StreamReader, StreamWriter,
+};
 use triplecargo::{Owner, Rules};
 
 fn make_header() -> DbHeader {
@@ -26,7 +28,10 @@ fn sample_entries(n: usize) -> BTreeMap<u128, SolvedEntry> {
         let key = (i as u128) * 0x1_0000_0001u128 + 0xABC_u128;
         let entry = SolvedEntry {
             value: ((i as i32 % 7) - 3) as i8,
-            best_move: Some(triplecargo::Move { card_id: (i % 10) as u16, cell: (i % 9) as u8 }),
+            best_move: Some(triplecargo::Move {
+                card_id: (i % 10) as u16,
+                cell: (i % 9) as u8,
+            }),
             depth: (i % 9) as u8,
         };
         map.insert(key, entry);
@@ -46,7 +51,11 @@ fn tmp_file(name: &str, ext: &str) -> PathBuf {
 
 #[test]
 fn stream_roundtrip_none_lz4_zstd() -> Result<(), String> {
-    for comp in [StreamCompression::None, StreamCompression::Lz4, StreamCompression::Zstd] {
+    for comp in [
+        StreamCompression::None,
+        StreamCompression::Lz4,
+        StreamCompression::Zstd,
+    ] {
         let header = make_header();
         let entries = sample_entries(10_000);
 
@@ -65,7 +74,12 @@ fn stream_roundtrip_none_lz4_zstd() -> Result<(), String> {
         // Reader compaction to map
         let mut reader = StreamReader::open(&stream_path)?;
         let got = reader.read_all_compacted()?;
-        assert_eq!(entries.len(), got.len(), "map length differs for comp={:?}", comp);
+        assert_eq!(
+            entries.len(),
+            got.len(),
+            "map length differs for comp={:?}",
+            comp
+        );
         for (k, v) in &entries {
             let g = got.get(k).expect("missing key from compaction");
             assert_eq!(v.value, g.value);
@@ -120,13 +134,20 @@ fn stream_crc_detection() -> Result<(), String> {
     {
         let mut bytes = Vec::new();
         {
-            let mut f = OpenOptions::new().read(true).open(&stream_path).map_err(|e| e.to_string())?;
+            let mut f = OpenOptions::new()
+                .read(true)
+                .open(&stream_path)
+                .map_err(|e| e.to_string())?;
             f.read_to_end(&mut bytes).map_err(|e| e.to_string())?;
         }
         if let Some(last) = bytes.last_mut() {
             *last ^= 0xFF;
         }
-        let mut f = OpenOptions::new().write(true).truncate(true).open(&stream_path).map_err(|e| e.to_string())?;
+        let mut f = OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&stream_path)
+            .map_err(|e| e.to_string())?;
         f.write_all(&bytes).map_err(|e| e.to_string())?;
         f.flush().map_err(|e| e.to_string())?;
     }

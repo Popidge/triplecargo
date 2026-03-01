@@ -1,8 +1,8 @@
 use std::fs::File;
 use tempfile::tempdir;
 
-use triplecargo::solver::{PlainJsonlWriter, GraphJsonlSink};
 use triplecargo::solver::graph_writer::BUF_WRITER_CAP_BYTES;
+use triplecargo::solver::{GraphJsonlSink, PlainJsonlWriter};
 
 #[test]
 fn plain_writer_nohash_finish_returns_none_digest() {
@@ -16,7 +16,10 @@ fn plain_writer_nohash_finish_returns_none_digest() {
     let stats = w.finish_mut().expect("finish");
 
     assert_eq!(stats.total_lines, 1);
-    assert!(stats.nodes_sha256_hex.is_none(), "expected None when hashing disabled");
+    assert!(
+        stats.nodes_sha256_hex.is_none(),
+        "expected None when hashing disabled"
+    );
     assert!(stats.index_sha256_hex.is_none());
     assert!(stats.nodes_sha256_list.is_none());
 

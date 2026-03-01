@@ -22,8 +22,8 @@ fn token128_from_seed(seed: u64) -> u128 {
 
 // Domain tags (arbitrary but fixed)
 const DOM_BOARD: u64 = 0xB0A2_1D5E_0000_0001;
-const DOM_HAND:  u64 = 0xB0A2_1D5E_0000_00A0;
-const DOM_NEXT:  u64 = 0xB0A2_1D5E_0000_00C0;
+const DOM_HAND: u64 = 0xB0A2_1D5E_0000_00A0;
+const DOM_NEXT: u64 = 0xB0A2_1D5E_0000_00C0;
 const DOM_RULES: u64 = 0xB0A2_1D5E_0000_00D0;
 
 /// Public Zobrist tokens for incremental maintenance
@@ -34,10 +34,7 @@ pub fn z_token_board(cell: u8, owner: Owner, card_id: u16) -> u128 {
         Owner::A => 0,
         Owner::B => 1,
     };
-    let seed = DOM_BOARD
-        ^ (cell as u64)
-        ^ (owner_bit << 8)
-        ^ ((card_id as u64) << 16);
+    let seed = DOM_BOARD ^ (cell as u64) ^ (owner_bit << 8) ^ ((card_id as u64) << 16);
     token128_from_seed(seed)
 }
 

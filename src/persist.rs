@@ -59,8 +59,10 @@ pub fn fingerprint_cards(cards: &CardsDb) -> u128 {
 #[inline]
 fn mix_card(a: &mut u64, b: &mut u64, c: &Card) {
     // Pack sides into u64
-    let sides: u64 =
-        (c.top as u64) | ((c.right as u64) << 8) | ((c.bottom as u64) << 16) | ((c.left as u64) << 24);
+    let sides: u64 = (c.top as u64)
+        | ((c.right as u64) << 8)
+        | ((c.bottom as u64) << 16)
+        | ((c.left as u64) << 24);
 
     let kind: u8 = match c.kind {
         crate::cards::CardKind::Monster => 0,
@@ -83,7 +85,12 @@ fn mix_card(a: &mut u64, b: &mut u64, c: &Card) {
 
     // Mix several tagged words to avoid accidental collisions
     mix_into(a, b, (c.id as u64) | (0x11u64 << 56), 0x9E37_79B9_7F4A_7C15);
-    mix_into(a, b, (c.level as u64) | (0x12u64 << 56), 0xBF58_476D_1CE4_E5B9);
+    mix_into(
+        a,
+        b,
+        (c.level as u64) | (0x12u64 << 56),
+        0xBF58_476D_1CE4_E5B9,
+    );
     mix_into(a, b, (kind as u64) | (0x13u64 << 56), 0x94D0_49BB_1331_11EB);
     mix_into(a, b, (elem as u64) | (0x14u64 << 56), 0xA5A5_A5A5_A5A5_A5A5);
     mix_into(a, b, sides | (0x15u64 << 56), 0xC3A5_C85C_97CB_3127);
@@ -123,10 +130,9 @@ pub fn save_db<P: AsRef<Path>>(
 }
 
 /// Load database from a file that was written by save_db.
-pub fn load_db<P: AsRef<Path>>(
-    path: P,
-) -> Result<(DbHeader, BTreeMap<u128, SolvedEntry>), String> {
+pub fn load_db<P: AsRef<Path>>(path: P) -> Result<(DbHeader, BTreeMap<u128, SolvedEntry>), String> {
     let bytes = fs::read(path.as_ref()).map_err(|e| format!("read error: {e}"))?;
-    let db: SolvedDb = bincode::deserialize(&bytes).map_err(|e| format!("bincode deserialize error: {e}"))?;
+    let db: SolvedDb =
+        bincode::deserialize(&bytes).map_err(|e| format!("bincode deserialize error: {e}"))?;
     Ok((db.header, db.entries))
 }

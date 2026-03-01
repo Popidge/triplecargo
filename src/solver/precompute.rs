@@ -1,20 +1,20 @@
 use std::collections::BTreeMap;
 use std::hash::BuildHasherDefault;
-use std::sync::{Arc};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
-use rayon::prelude::*;
 use hashbrown::HashSet as HbHashSet;
+use rayon::prelude::*;
 
 use crate::cards::CardsDb;
 use crate::engine::apply::apply_move;
 use crate::hash::zobrist_key;
 use crate::persist::{ElementsMode, SolvedEntry};
-use crate::state::{is_terminal, legal_moves, GameState};
 use crate::solver::move_order::order_moves;
 use crate::solver::negamax::search_root;
-use crate::solver::tt::{Bound, InMemoryTT, TTEntry, TranspositionTable, TTStats};
+use crate::solver::tt::{Bound, InMemoryTT, TTEntry, TTStats, TranspositionTable};
+use crate::state::{is_terminal, legal_moves, GameState};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 
 type FastHasher = BuildHasherDefault<ahash::AHasher>;
@@ -110,7 +110,17 @@ fn dfs_enumerate_and_solve(
     let moves = legal_moves(state);
     for mv in moves {
         if let Ok(ns) = apply_move(state, cards, mv) {
-            dfs_enumerate_and_solve(&ns, cards, tt, visited, nodes_acc, max_depth, nodes_total, states_total, pb);
+            dfs_enumerate_and_solve(
+                &ns,
+                cards,
+                tt,
+                visited,
+                nodes_acc,
+                max_depth,
+                nodes_total,
+                states_total,
+                pb,
+            );
         }
     }
 }
@@ -140,68 +150,66 @@ pub fn precompute_solve(
     // Deterministically order root moves for better load balance
     let mut roots = legal_moves(initial);
     order_moves(&mut roots, None);
- 
+
     // Multi-progress bars
     let mp = MultiProgress::new();
     let root_pb = mp.add(ProgressBar::new(roots.len() as u64));
-    root_pb
-        .set_style(ProgressStyle::with_template("[{elapsed_precise}] roots {bar:40.cyan/blue} {pos}/{len}")
+    root_pb.set_style(
+        ProgressStyle::with_template("[{elapsed_precise}] roots {bar:40.cyan/blue} {pos}/{len}")
             .unwrap()
-            .progress_chars("=>-"));
- 
+            .progress_chars("=>-"),
+    );
+
     let states_pb = mp.add(ProgressBar::new_spinner());
-    states_pb
-        .set_style(ProgressStyle::with_template("[{elapsed_precise}] states ~{pos} {msg}")
-            .unwrap());
+    states_pb.set_style(
+        ProgressStyle::with_template("[{elapsed_precise}] states ~{pos} {msg}").unwrap(),
+    );
     states_pb.enable_steady_tick(std::time::Duration::from_millis(100));
- 
+
     let nodes_pb = mp.add(ProgressBar::new_spinner());
     nodes_pb
-        .set_style(ProgressStyle::with_template("[{elapsed_precise}] nodes ~{pos} {msg}")
-            .unwrap());
+        .set_style(ProgressStyle::with_template("[{elapsed_precise}] nodes ~{pos} {msg}").unwrap());
     nodes_pb.enable_steady_tick(std::time::Duration::from_millis(250));
- 
+
     // Shared counters for rates
     let start = Instant::now();
     let nodes_total = Arc::new(AtomicU64::new(0));
     let states_total = Arc::new(AtomicU64::new(0));
- 
+
     // Background rate updater
     {
         let states_pb = states_pb.clone();
         let nodes_pb = nodes_pb.clone();
         let nodes_total_c = Arc::clone(&nodes_total);
         let states_total_c = Arc::clone(&states_total);
-        std::thread::spawn(move || {
-            loop {
-                std::thread::sleep(std::time::Duration::from_millis(500));
-                let elapsed = start.elapsed().as_secs_f64().max(1e-6);
-                let s = states_total_c.load(Ordering::Relaxed);
-                let n = nodes_total_c.load(Ordering::Relaxed);
-                states_pb.set_message(format!("{:.0}/s", (s as f64 / elapsed)));
-                states_pb.set_position(s);
-                nodes_pb.set_message(format!("{:.0}/s", (n as f64 / elapsed)));
-                nodes_pb.set_position(n);
-            }
+        std::thread::spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            let elapsed = start.elapsed().as_secs_f64().max(1e-6);
+            let s = states_total_c.load(Ordering::Relaxed);
+            let n = nodes_total_c.load(Ordering::Relaxed);
+            states_pb.set_message(format!("{:.0}/s", (s as f64 / elapsed)));
+            states_pb.set_position(s);
+            nodes_pb.set_message(format!("{:.0}/s", (n as f64 / elapsed)));
+            nodes_pb.set_position(n);
         });
     }
- 
+
     // Capture depth cap for parallel workers
     let cap = max_depth;
- 
+
     let results: Vec<(Vec<(u128, TTEntry)>, u64, u64, TTStats)> = roots
         .par_iter()
         .map(|mv| {
             let mut nodes: u64 = 0;
             let mut visited: FastSet = HbHashSet::default();
             let mut tt = InMemoryTT::default();
- 
+
             // Clone progress bars and counters for this worker (they share internal state)
             let local_states = states_pb.clone();
             let local_root = root_pb.clone();
             let local_nodes_total = Arc::clone(&nodes_total);
             let local_states_total = Arc::clone(&states_total);
- 
+
             if let Ok(child) = apply_move(initial, cards, *mv) {
                 dfs_enumerate_and_solve(
                     &child,
@@ -222,7 +230,7 @@ pub fn precompute_solve(
             (items, nodes, enumerated, stats)
         })
         .collect();
- 
+
     // Finish progress bars
     root_pb.finish_and_clear();
     states_pb.finish_and_clear();

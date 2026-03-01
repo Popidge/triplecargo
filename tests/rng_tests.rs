@@ -10,7 +10,10 @@ fn sample(seq_len: usize, seed: u64, game_id: u64, turn: u8) -> Vec<u64> {
 fn rng_stability_same_triple() {
     let a = sample(16, 0xDEAD_BEEFu64, 0xCAFE_BABEu64, 7);
     let b = sample(16, 0xDEAD_BEEFu64, 0xCAFE_BABEu64, 7);
-    assert_eq!(a, b, "rng_for_state must produce stable sequences for identical (seed, game_id, turn)");
+    assert_eq!(
+        a, b,
+        "rng_for_state must produce stable sequences for identical (seed, game_id, turn)"
+    );
 }
 
 #[test]
