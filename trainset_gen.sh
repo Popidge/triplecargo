@@ -1,87 +1,55 @@
-THREADS=11
+# Build
+cargo build --release
+mkdir -p data/exports
+
+THREADS=15
 CHUNK=32
-ROLLOUTS=256
 
-# NONE
+RULES="same,plus,elemental"
+ELEMENTS="random"
+
+TAU=0.5
+QMODE="margin"
+VALUE_MODE="winloss"
+
+# Train
 target/release/precompute \
-  --export data/exports/traj_train_none.jsonl \
+  --export data/exports/traj_train_spe_soft_exact.jsonl \
   --export-mode trajectory \
-  --games 200000 \
+  --games 20000 \
   --seed 20260301 \
   --threads $THREADS --chunk-size $CHUNK \
   --hand-strategy stratified \
-  --rules none --elements none \
-  --policy-format mcts --mcts-rollouts $ROLLOUTS \
-  --value-mode winloss
+  --rules $RULES --elements $ELEMENTS \
+  --policy-format soft_exact \
+  --soft-exact-temperature $TAU \
+  --soft-exact-qmode $QMODE \
+  --value-mode $VALUE_MODE
 
-# ELEMENTAL
+# Val
 target/release/precompute \
-  --export data/exports/traj_train_elemental.jsonl \
+  --export data/exports/traj_val_spe_soft_exact.jsonl \
   --export-mode trajectory \
-  --games 200000 \
-  --seed 20260301 \
+  --games 5000 \
+  --seed 20260302 \
   --threads $THREADS --chunk-size $CHUNK \
   --hand-strategy stratified \
-  --rules elemental --elements random \
-  --policy-format mcts --mcts-rollouts $ROLLOUTS \
-  --value-mode winloss
+  --rules $RULES --elements $ELEMENTS \
+  --policy-format soft_exact \
+  --soft-exact-temperature $TAU \
+  --soft-exact-qmode $QMODE \
+  --value-mode $VALUE_MODE
 
-# SAME
+# Test
 target/release/precompute \
-  --export data/exports/traj_train_same.jsonl \
+  --export data/exports/traj_test_spe_soft_exact.jsonl \
   --export-mode trajectory \
-  --games 200000 \
-  --seed 20260301 \
+  --games 5000 \
+  --seed 20260303 \
   --threads $THREADS --chunk-size $CHUNK \
   --hand-strategy stratified \
-  --rules same --elements none \
-  --policy-format mcts --mcts-rollouts $ROLLOUTS \
-  --value-mode winloss
-
-# SAME+PLUS
-target/release/precompute \
-  --export data/exports/traj_train_same_plus.jsonl \
-  --export-mode trajectory \
-  --games 200000 \
-  --seed 20260301 \
-  --threads $THREADS --chunk-size $CHUNK \
-  --hand-strategy stratified \
-  --rules same,plus --elements none \
-  --policy-format mcts --mcts-rollouts $ROLLOUTS \
-  --value-mode winloss
-
-# SAME+ELEMENTAL
-target/release/precompute \
-  --export data/exports/traj_train_same_elemental.jsonl \
-  --export-mode trajectory \
-  --games 200000 \
-  --seed 20260301 \
-  --threads $THREADS --chunk-size $CHUNK \
-  --hand-strategy stratified \
-  --rules same,elemental --elements random \
-  --policy-format mcts --mcts-rollouts $ROLLOUTS \
-  --value-mode winloss
-
-# PLUS+ELEMENTAL
-target/release/precompute \
-  --export data/exports/traj_train_plus_elemental.jsonl \
-  --export-mode trajectory \
-  --games 200000 \
-  --seed 20260301 \
-  --threads $THREADS --chunk-size $CHUNK \
-  --hand-strategy stratified \
-  --rules plus,elemental --elements random \
-  --policy-format mcts --mcts-rollouts $ROLLOUTS \
-  --value-mode winloss
-
-# SAME+PLUS+ELEMENTAL
-target/release/precompute \
-  --export data/exports/traj_train_same_plus_elemental.jsonl \
-  --export-mode trajectory \
-  --games 200000 \
-  --seed 20260301 \
-  --threads $THREADS --chunk-size $CHUNK \
-  --hand-strategy stratified \
-  --rules same,plus,elemental --elements random \
-  --policy-format mcts --mcts-rollouts $ROLLOUTS \
-  --value-mode winloss
+  --rules $RULES --elements $ELEMENTS \
+  --policy-format soft_exact \
+  --soft-exact-temperature $TAU \
+  --soft-exact-qmode $QMODE \
+  --value-mode $VALUE_MODE
