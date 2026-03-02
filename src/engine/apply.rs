@@ -189,7 +189,33 @@ fn build_capture_mask(board: &Board, cards: &CardsDb, rules: &Rules, placed_idx:
         }
     }
 
-    // Basic / Combo expansion using BFS from rule-defined sources.
+    // Placed-card Basic applies when Same did not trigger.
+    // These captures are not combo-eligible and therefore are never BFS sources.
+    if !same_triggered {
+        let placed_sides = adjusted_sides_for_cell(placed_card, placed_idx, board, rules);
+        for i in 0..4 {
+            let Some(nidx) = occ_idx[i] else {
+                continue;
+            };
+            let neigh_owner = owner_after_mask(board, nidx, placed_owner, &capture_mask)
+                .expect("neighbor card must exist for placed-card basic");
+            if neigh_owner == placed_owner {
+                continue;
+            }
+            let Some(nslot) = board.get(nidx) else {
+                continue;
+            };
+            let Some(ncard) = cards.get(nslot.card_id) else {
+                continue;
+            };
+            let n_sides = adjusted_sides_for_cell(ncard, nidx, board, rules);
+            if placed_sides[i] > n_sides[(i + 2) % 4] {
+                capture_mask[nidx as usize] = true;
+            }
+        }
+    }
+
+    // Combo expansion using BFS from Same/Plus captures only.
     let mut q: VecDeque<u8> = VecDeque::new();
     let mut enqueued = [false; 9];
 
@@ -204,8 +230,6 @@ fn build_capture_mask(board: &Board, cards: &CardsDb, rules: &Rules, placed_idx:
             }
         }
     } else {
-        enqueued[placed_idx as usize] = true;
-        q.push_back(placed_idx);
         for i in 0..4 {
             if plus_captured_dirs[i] {
                 let idx = occ_idx[i].expect("plus capture direction must have occupied neighbor");

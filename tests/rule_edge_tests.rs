@@ -450,6 +450,54 @@ fn plus_and_basic_can_both_apply() {
     );
 }
 
+/// Basic captures from the placed card do not seed combo cascades.
+#[test]
+fn placed_basic_capture_does_not_trigger_combo_chain() {
+    let cards = cards_db();
+    let rules = Rules::basic_only();
+
+    // A plays Pandemonia id=93 at cell 5.
+    // Basic capture: top (cell 2, Cerberus id=94) flips because 10 > 6.
+    // If that basic capture incorrectly seeded Combo, id=94 would then flip cell 1
+    // (left=10 vs right<=10). Correct behavior: cell 1 remains B.
+    let mut state = GameState::with_hands(rules, [93, 2, 3, 4, 5], [94, 60, 8, 9, 10], None);
+    state.board.set(
+        2,
+        Some(triplecargo::board::Slot {
+            owner: Owner::B,
+            card_id: 94,
+        }),
+    );
+    state.board.set(
+        1,
+        Some(triplecargo::board::Slot {
+            owner: Owner::B,
+            card_id: 60,
+        }),
+    );
+
+    let ns = apply_move(
+        &state,
+        &cards,
+        Move {
+            card_id: 93,
+            cell: 5,
+        },
+    )
+    .expect("apply_move");
+
+    assert_eq!(
+        ns.board.get(2).unwrap().owner,
+        Owner::A,
+        "basic captured top"
+    );
+    assert_eq!(
+        ns.board.get(1).unwrap().owner,
+        Owner::B,
+        "basic capture must not start combo chain"
+    );
+}
+
 /// Elemental modifiers do not affect Same checks.
 #[test]
 fn elemental_does_not_affect_same() {
